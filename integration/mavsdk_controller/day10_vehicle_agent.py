@@ -142,8 +142,17 @@ class VehicleAgent:
             status, reason = "rejected", "invalid_mission_assignment"
             accepted = False
             if isinstance(mission_id, str) and mission_id.strip():
+                completed_mission_id = payload.get("completed_mission_id")
+                handoff = (
+                    envelope.get("sender") == "coordinator"
+                    and getattr(self.args, "accept_ambulance_standby", False)
+                    and self.mission_state == "acknowledged"
+                    and self.mission_id is not None
+                    and completed_mission_id == self.mission_id
+                    and mission_id != self.mission_id
+                )
                 if (self.mission_id and self.mission_id != mission_id
-                        and self.mission_state not in TERMINAL):
+                        and self.mission_state not in TERMINAL and not handoff):
                     status, reason = "rejected", "another_nonterminal_mission_is_recorded"
                 else:
                     target = payload.get("target")
@@ -176,6 +185,8 @@ class VehicleAgent:
                             "state": mission_state, "execution_enabled": False,
                             "flight_commands_sent": False,
                         }
+                        if handoff:
+                            record["completed_mission_id"] = completed_mission_id
                         try:
                             atomic_json(self.args.mission_file, record)
                             atomic_json(self.args.state_file, {"vehicle_id": self.args.vehicle,

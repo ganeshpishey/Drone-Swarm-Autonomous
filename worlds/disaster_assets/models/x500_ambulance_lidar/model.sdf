@@ -49,6 +49,35 @@
         <always_on>true</always_on>
         <visualize>false</visualize>
       </sensor>
+      <sensor name="downward_clearance" type="gpu_lidar">
+        <topic>/ambulance_0/downward_clearance/scan</topic>
+        <gz_frame_id>ambulance_downward_clearance</gz_frame_id>
+        <pose>0 0 -0.18 0 1.57079632679 0</pose>
+        <update_rate>5</update_rate>
+        <lidar>
+          <scan>
+            <horizontal>
+              <samples>9</samples>
+              <resolution>1</resolution>
+              <min_angle>-0.20</min_angle>
+              <max_angle>0.20</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>9</samples>
+              <resolution>1</resolution>
+              <min_angle>-0.20</min_angle>
+              <max_angle>0.20</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>0.05</min>
+            <max>10.0</max>
+            <resolution>0.01</resolution>
+          </range>
+        </lidar>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+      </sensor>
     </link>
     <joint name="LidarJoint" type="fixed">
       <parent>base_link</parent>

@@ -47,6 +47,7 @@ async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--drain-seconds", type=float, default=2400.0)
     parser.add_argument("--reserve-percent", type=float, default=50.0)
+    parser.add_argument("--require-enabled", action="store_true")
     parser.add_argument(
         "--config",
         type=Path,
@@ -58,6 +59,15 @@ async def main() -> None:
     connected: dict[str, tuple[System, float, float]] = {}
     for name, config in vehicles.items():
         connected[name] = await connect_vehicle(name, config)
+
+    if args.require_enabled:
+        for name, (drone, _drain, _reserve) in connected.items():
+            enabled = await asyncio.wait_for(
+                drone.param.get_param_int("SIM_BAT_ENABLE"), timeout=5.0
+            )
+            if enabled != 1:
+                raise RuntimeError(f"{name}: SIM_BAT_ENABLE must be 1 for the approach demo")
+            print(f"Verified {name}: SIM_BAT_ENABLE=1")
 
     print("Preflight parameter check (all vehicles are landed):")
     for name, (_drone, drain, reserve) in connected.items():

@@ -1,0 +1,11 @@
+{
+  "schema_version": "scout-camera-gps-localization-policy-v1",
+  "accept_camera_gps_candidates": true,
+  "accepted_calibration_ids": [
+    "scout-gazebo-markers-20261111"
+  ],
+  "terrain_reference_id": "gazebo-earthquake-apron-collision-mesh",
+  "maximum_pose_age_s": 0.2,
+  "minimum_dispatch_confidence": 0.3,
+  "maximum_uncertainty_m": 0.75
+}

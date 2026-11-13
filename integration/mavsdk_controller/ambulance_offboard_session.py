@@ -7,8 +7,12 @@ from typing import AsyncIterable, Any
 
 from mavsdk_grpc.offboard import VelocityNedYaw
 
-from .ambulance_mission_adapter import SetpointOwnership
-from .ambulance_sortie_executor import AmbulanceSortieExecutor
+if __package__:
+    from .ambulance_mission_adapter import SetpointOwnership
+    from .ambulance_sortie_executor import AmbulanceSortieExecutor
+else:
+    from ambulance_mission_adapter import SetpointOwnership
+    from ambulance_sortie_executor import AmbulanceSortieExecutor
 
 
 class AmbulanceOffboardSession:
@@ -77,7 +81,7 @@ class AmbulanceOffboardSession:
             return 0
 
         # Never start Offboard on an initial HOLD or invalid state.
-        if getattr(first_guidance, "state", None) not in {"GOAL", "DETOUR"}:
+        if getattr(first_guidance, "state", None) not in {"GOAL", "DETOUR", "CLIMB"}:
             raise RuntimeError("ambulance_initial_guidance_not_actionable")
 
         first_setpoint = self.executor.build_setpoint(first_guidance)

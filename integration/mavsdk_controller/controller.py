@@ -131,8 +131,12 @@ class PX4Controller:
         z: float,
         timeout_s: float = 60.0,
         yaw_deg: float = 0.0,
+        *,
+        horizontal_tolerance_m: float = 1.5,
     ) -> None:
         """Fly to a local north/east/altitude waypoint and heading from home."""
+        if not math.isfinite(horizontal_tolerance_m) or horizontal_tolerance_m <= 0:
+            raise ValueError("Waypoint horizontal tolerance must be finite and positive")
         if not math.isfinite(z) or not 0.0 < z <= MAX_RELATIVE_ALTITUDE_M:
             raise ValueError(
                 f"Waypoint altitude must be greater than 0 and at most "
@@ -160,7 +164,9 @@ class PX4Controller:
                 "PX4 did not acknowledge the goto command within 15 seconds; "
                 "the survey will request RTL."
             ) from error
-        await self._wait_for_waypoint(x, y, z, timeout_s=timeout_s)
+        await self._wait_for_waypoint(
+            x, y, z, timeout_s=timeout_s, horizontal_tolerance_m=horizontal_tolerance_m,
+        )
 
     async def goto_position_ned(
         self,
@@ -218,7 +224,7 @@ class PX4Controller:
                         position.east_m - target_east_m,
                     )
                     altitude_error = abs(position.down_m - target_down_m)
-                    if horizontal_error <= 1.5 and altitude_error <= 1.0:
+                    if horizontal_error <= horizontal_tolerance_m and altitude_error <= 1.0:
                         return
 
             try:
@@ -241,7 +247,8 @@ class PX4Controller:
                 await self.drone.offboard.stop()
 
     async def _wait_for_waypoint(
-        self, north_m: float, east_m: float, altitude_m: float, timeout_s: float = 60.0
+        self, north_m: float, east_m: float, altitude_m: float, timeout_s: float = 60.0,
+        *, horizontal_tolerance_m: float = 1.5
     ) -> None:
         latest: tuple[float, float, float, float, float] | None = None
         next_report = asyncio.get_running_loop().time()

@@ -75,105 +75,130 @@ def _localization_quality_rejection(
     detection: dict[str, Any], report: dict[str, Any], frame: str,
     coordinates: list[float], status: str, policy: dict[str, Any] | None,
 ) -> str | None:
-    """Require the camera/LiDAR localizer's complete quality evidence."""
+    """Require independently approved camera-GPS evidence before dispatch.
+
+    LiDAR is intentionally absent from this contract: it is an obstacle-
+    avoidance sensor, not a victim-localization sensor. A projected GPS point
+    is still not dispatchable unless its camera calibration, terrain reference,
+    acquisition-time pose, and uncertainty are independently approved.
+    """
     if status != "validated":
         return None
     if not isinstance(policy, dict):
-        return "trusted_localization_policy_missing"
+        return "trusted_camera_gps_localization_policy_missing"
+
     calibration_ids = policy.get("accepted_calibration_ids")
-    if (policy.get("schema_version") != "scout-localization-policy-v1"
-            or not isinstance(calibration_ids, list) or not calibration_ids):
-        return "trusted_localization_policy_invalid_or_has_no_approved_calibration"
-    if frame != "local_ned_m":
-        return "validated_location_must_be_scout_local_ned"
+    if (policy.get("schema_version") != "scout-camera-gps-localization-policy-v1"
+            or not isinstance(calibration_ids, list) or not calibration_ids
+            or any(not isinstance(value, str) or not value.strip()
+                   for value in calibration_ids)):
+        return "trusted_camera_gps_policy_invalid_or_has_no_approved_calibration"
+
+    if frame != "wgs84_geodetic":
+        return "validated_camera_gps_location_must_be_wgs84_geodetic"
     if detection.get("localization_status") != "validated":
-        return "validated_localization_status_missing"
-    if detection.get("depth_status") != "associated" or detection.get("dispatchable") is not True:
-        return "validated_camera_lidar_depth_association_missing"
-    reference = detection.get("reference_vehicle_id", detection.get("coordinate_reference_vehicle_id",
-                         report.get("coordinate_reference_vehicle_id")))
+        return "validated_camera_gps_localization_status_missing"
+    if detection.get("dispatchable") is not True:
+        return "camera_gps_localizer_did_not_mark_detection_dispatchable"
+
+    reference = detection.get(
+        "reference_vehicle_id",
+        detection.get("coordinate_reference_vehicle_id",
+                      report.get("coordinate_reference_vehicle_id",
+                                 report.get("vehicle"))),
+    )
     if reference != "scout_0":
-        return "validated_location_reference_must_be_scout_0"
+        return "camera_gps_location_reference_must_be_scout_0"
+
+    provenance = detection.get("camera_gps_provenance")
+    if not isinstance(provenance, dict):
+        provenance = detection.get("transformation_provenance")
+    if not isinstance(provenance, dict):
+        return "camera_gps_provenance_missing"
+
+    calibration_id = provenance.get("calibration_id")
+    if not isinstance(calibration_id, str) or not calibration_id.strip():
+        return "camera_calibration_id_missing"
+    if calibration_id not in calibration_ids:
+        return "camera_calibration_id_not_approved_by_coordinator"
+    if provenance.get("calibration_status") != "empirically_verified":
+        return "camera_calibration_not_empirically_verified"
+    if provenance.get("camera_model") not in {"pinhole", "pinhole_distortion_corrected"}:
+        return "camera_projection_model_missing_or_unsupported"
+    if provenance.get("camera_mount_transform_status") != "empirically_verified":
+        return "camera_mount_transform_not_empirically_verified"
+    if provenance.get("terrain_reference_status") != "surveyed_or_independently_validated":
+        return "terrain_reference_not_independently_validated"
+    if provenance.get("pose_interpolation_status") != "bracketed_at_image_acquisition":
+        return "camera_acquisition_pose_not_bracketed"
+    if provenance.get("timestamp_domain") != "host_monotonic_capture":
+        return "camera_gps_capture_timestamp_domain_untrusted"
+
     origin = detection.get("coordinate_origin_id", report.get("coordinate_origin_id"))
     if not isinstance(origin, str) or not origin.strip():
-        return "validated_location_px4_origin_id_missing"
-
-    provenance = detection.get("transformation_provenance")
-    if (not isinstance(provenance, dict)
-            or not isinstance(provenance.get("calibration_id"), str)
-            or not provenance["calibration_id"].strip()
-            or provenance.get("camera_from_lidar") != "empirically_verified_4x4"
-            or provenance.get("body_frd_from_lidar") != "empirically_verified_4x4"
-            or provenance.get("body_frd_to_ned") != "PX4_roll_pitch_yaw_rotation"
-            or provenance.get("timestamp_domain") != "host_monotonic_capture"
-            or provenance.get("coordinate_origin_id") != origin):
-        return "validated_transform_provenance_incomplete"
-    if provenance.get("calibration_id") not in calibration_ids:
-        return "localization_calibration_id_not_approved_by_coordinator"
-
-    confidence = detection.get("confidence")
-    minimum_confidence = provenance.get("minimum_dispatch_confidence")
-    supporting = detection.get("supporting_returns")
-    minimum_supporting = provenance.get("minimum_supporting_returns")
-    trusted_min_confidence = policy.get("minimum_dispatch_confidence")
-    trusted_min_support = policy.get("minimum_supporting_returns")
-    if (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
-            or not math.isfinite(confidence)
-            or not isinstance(trusted_min_confidence, (int, float)) or isinstance(trusted_min_confidence, bool)
-            or not math.isfinite(trusted_min_confidence) or not 0 <= trusted_min_confidence <= 1
-            or confidence < trusted_min_confidence
-            or isinstance(supporting, bool) or not isinstance(supporting, int)
-            or isinstance(trusted_min_support, bool) or not isinstance(trusted_min_support, int)
-            or trusted_min_support < 1 or supporting < trusted_min_support):
-        return "localization_confidence_or_return_support_below_dispatch_limit"
-
-    uncertainty = detection.get("localization_uncertainty_m")
-    limit = provenance.get("max_dispatch_uncertainty_m")
-    if (not isinstance(uncertainty, (int, float)) or isinstance(uncertainty, bool)
-            or not math.isfinite(uncertainty) or uncertainty < 0
-            or not isinstance(limit, (int, float)) or isinstance(limit, bool)
-            or not math.isfinite(limit) or limit <= 0 or uncertainty > limit):
-        return "localization_uncertainty_missing_or_over_limit"
+        return "scout_px4_coordinate_origin_id_missing"
+    if provenance.get("coordinate_origin_id") != origin:
+        return "camera_gps_coordinate_origin_provenance_mismatch"
 
     sensor_times = detection.get("sensor_timestamps_monotonic_s")
     if not isinstance(sensor_times, dict):
-        return "sensor_capture_timestamps_missing"
+        sensor_times = provenance.get("sensor_timestamps_monotonic_s")
+    if not isinstance(sensor_times, dict):
+        return "camera_gps_capture_timestamps_missing"
     try:
-        image_time, lidar_time, pose_time = (
-            sensor_times[key] for key in ("image_capture", "lidar_capture", "scout_pose")
-        )
+        image_time = sensor_times["image_capture"]
+        pose_time = sensor_times["scout_pose"]
         if any(isinstance(value, bool) or not isinstance(value, (int, float))
-               or not math.isfinite(value) for value in (image_time, lidar_time, pose_time)):
+               or not math.isfinite(value) for value in (image_time, pose_time)):
             raise ValueError
-        delta = detection.get("timestamp_delta_s")
-        pose_age = detection.get("pose_age_s")
-        max_delta = provenance.get("max_camera_lidar_delta_s")
-        max_pose_age = provenance.get("max_pose_age_s")
-        max_delta = policy.get("maximum_camera_lidar_delta_s")
-        max_pose_age = policy.get("maximum_pose_age_s")
-        max_uncertainty = policy.get("maximum_uncertainty_m")
-        if (not isinstance(max_delta, (int, float)) or isinstance(max_delta, bool)
-                or not math.isfinite(max_delta) or max_delta <= 0
-                or not isinstance(max_pose_age, (int, float)) or isinstance(max_pose_age, bool)
-                or not math.isfinite(max_pose_age) or max_pose_age <= 0
-                or not isinstance(max_uncertainty, (int, float)) or isinstance(max_uncertainty, bool)
-                or not math.isfinite(max_uncertainty) or max_uncertainty <= 0):
-            return "trusted_localization_policy_thresholds_invalid"
-        if (not isinstance(delta, (int, float)) or isinstance(delta, bool)
-                or not math.isfinite(delta) or delta < 0
-                or delta > max_delta
-                or not isinstance(pose_age, (int, float)) or isinstance(pose_age, bool)
-                or not math.isfinite(pose_age) or pose_age < 0
-                or pose_age > max_pose_age):
-            return "sensor_or_pose_timestamps_outside_quality_bounds"
-        if abs(abs(image_time - lidar_time) - delta) > 1e-3:
-            return "sensor_timestamp_delta_provenance_mismatch"
+        pose_age = abs(float(image_time) - float(pose_time))
     except (KeyError, TypeError, ValueError):
-        return "sensor_capture_timestamps_invalid"
-    if uncertainty > max_uncertainty:
-        return "localization_uncertainty_exceeds_trusted_coordinator_limit"
-    if len(coordinates) != 3 or any(not math.isfinite(value) for value in coordinates):
-        return "validated_location_coordinates_invalid"
+        return "camera_gps_capture_timestamps_invalid"
+
+    maximum_pose_age = policy.get("maximum_pose_age_s")
+    if (isinstance(maximum_pose_age, bool)
+            or not isinstance(maximum_pose_age, (int, float))
+            or not math.isfinite(maximum_pose_age) or maximum_pose_age <= 0):
+        return "trusted_camera_gps_pose_age_threshold_invalid"
+    if pose_age > maximum_pose_age:
+        return "camera_pose_not_synchronized_to_image_acquisition"
+    if provenance.get("pose_age_s") is not None:
+        recorded_age = provenance["pose_age_s"]
+        if (isinstance(recorded_age, bool) or not isinstance(recorded_age, (int, float))
+                or not math.isfinite(recorded_age)
+                or abs(float(recorded_age) - pose_age) > 1e-3):
+            return "camera_gps_pose_age_provenance_mismatch"
+
+    confidence = detection.get("confidence")
+    minimum_confidence = policy.get("minimum_dispatch_confidence")
+    if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+            or not math.isfinite(confidence)
+            or isinstance(minimum_confidence, bool)
+            or not isinstance(minimum_confidence, (int, float))
+            or not math.isfinite(minimum_confidence)
+            or not 0 <= minimum_confidence <= 1
+            or confidence < minimum_confidence):
+        return "camera_detection_confidence_below_dispatch_limit"
+
+    uncertainty = detection.get("localization_uncertainty_m")
+    maximum_uncertainty = policy.get("maximum_uncertainty_m")
+    if (isinstance(uncertainty, bool) or not isinstance(uncertainty, (int, float))
+            or not math.isfinite(uncertainty) or uncertainty < 0
+            or isinstance(maximum_uncertainty, bool)
+            or not isinstance(maximum_uncertainty, (int, float))
+            or not math.isfinite(maximum_uncertainty) or maximum_uncertainty <= 0
+            or uncertainty > maximum_uncertainty):
+        return "camera_gps_uncertainty_missing_or_over_limit"
+
+    if (len(coordinates) != 3
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) for value in coordinates)):
+        return "validated_wgs84_coordinates_invalid"
+    latitude, longitude, altitude = coordinates
+    if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        return "validated_wgs84_coordinates_out_of_range"
+    if not math.isfinite(altitude):
+        return "validated_wgs84_altitude_invalid"
     return None
 
 
@@ -232,6 +257,44 @@ class Day10Coordinator:
         detection_indices: dict[str, int] = {}
         for index, detection in enumerate(detections):
             located = coordinate_for(detection, report)
+            candidate_rejection = None
+            if (located is None and detection.get("location_status") == "camera_gps_projected"
+                    and detection.get("localization_status") == "candidate"
+                    and report.get("source") == "scout_rgb_camera_ai"
+                    and report.get("synthetic_test") is not True
+                    and detection.get("ground_truth") is False):
+                provenance = detection.get("camera_gps_provenance")
+                policy = self.localization_policy or {}
+                coordinates = [
+                    detection.get("latitude_deg"), detection.get("longitude_deg"),
+                    detection.get("altitude_m"),
+                ]
+                candidate_rejection = "camera_gps_candidate_policy_or_provenance_invalid"
+                if (isinstance(provenance, dict)
+                        and policy.get("accept_camera_gps_candidates") is True
+                        and policy.get("terrain_reference_id")
+                        and provenance.get("terrain_reference_id") == policy["terrain_reference_id"]
+                        and provenance.get("terrain_reference_status") == "independently_validated"):
+                    bracket = provenance.get("pose_bracket_s")
+                    residual = provenance.get("clock_mapping_sigma_s")
+                    if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                           and math.isfinite(value) and 0 <= value <= limit
+                           for value, limit in ((bracket, 0.2), (residual, 0.01))):
+                        reviewed = {
+                            **detection,
+                            "localization_status": "validated",
+                            "dispatchable": True,
+                            "camera_gps_provenance": {
+                                **provenance,
+                                "terrain_reference_status": "surveyed_or_independently_validated",
+                            },
+                        }
+                        frame = detection.get("coordinate_frame")
+                        candidate_rejection = _localization_quality_rejection(
+                            reviewed, report, frame, coordinates, "validated", policy)
+                        if candidate_rejection is None:
+                            detection = reviewed
+                            located = (frame, coordinates, "validated")
             incident_id = f"{report['report_id']}:{index}"
             track_box = None
             track_meta = None
@@ -330,19 +393,20 @@ class Day10Coordinator:
                 "target": None,
                 # Preserve perception quality and rejection evidence for the
                 # operator. These fields never upgrade an incident's status.
-                "depth_status": detection.get("depth_status", "unavailable"),
+                "depth_status": detection.get("depth_status", "not_used_for_victim_localization"),
                 "localization_status": detection.get("localization_status", "unlocalized"),
                 "localization_uncertainty_m": detection.get("localization_uncertainty_m"),
                 "localization_confidence": detection.get("localization_confidence"),
                 "localization_rejection_reason": detection.get("rejection_reason"),
-                "localization_provenance": detection.get("transformation_provenance"),
+                "localization_provenance": detection.get("camera_gps_provenance",
+                                                         detection.get("transformation_provenance")),
+                "camera_gps_provenance": detection.get("camera_gps_provenance"),
                 "approximate_location": detection.get("approximate_location"),
                 "sensor_timestamps": detection.get("sensor_timestamps_monotonic_s"),
                 "supporting_sensor_information": {
-                    "depth_status": detection.get("depth_status", "unavailable"),
-                    "supporting_returns": detection.get("supporting_returns"),
+                    "depth_status": detection.get("depth_status", "not_used_for_victim_localization"),
                     "sensor_timestamps_monotonic_s": detection.get("sensor_timestamps_monotonic_s"),
-                    "transformation_provenance": detection.get("transformation_provenance"),
+                    "camera_gps_provenance": detection.get("camera_gps_provenance"),
                 },
                 "dispatchable": False,
             }
@@ -355,6 +419,8 @@ class Day10Coordinator:
                     "image_sequence": track_meta["sequence"],
                     "confidence": float(detection["confidence"]),
                 }]
+            if candidate_rejection is not None:
+                item["localization_rejection_reason"] = candidate_rejection
             if located is not None:
                 frame, coordinates, location_status = located
                 rejection = _localization_quality_rejection(
@@ -395,6 +461,8 @@ class Day10Coordinator:
         task_minutes: float,
         return_minutes: float,
         now: datetime | None = None,
+        standby_only: bool = False,
+        airborne_continuation: bool = False,
     ) -> dict[str, Any]:
         now = now or datetime.now(timezone.utc)
         incident = self.incidents.get(incident_id)
@@ -433,9 +501,19 @@ class Day10Coordinator:
             age = (now - sample_time.astimezone(timezone.utc)).total_seconds()
         except (ValueError, TypeError):
             age = math.inf
-        if age < -2 or age > 15 or vehicle_status.get("connected") is not True or vehicle_status.get("in_air") is not False or vehicle_status.get("available") is not True:
+        ready = (
+            vehicle_status.get("in_air") is True
+            and vehicle_status.get("armed") is True
+            and vehicle_status.get("fresh") is True
+            if airborne_continuation else
+            vehicle_status.get("in_air") is False and vehicle_status.get("available") is True
+        )
+        if age < -2 or age > 15 or vehicle_status.get("connected") is not True or not ready:
             return {"eligible": False, "reason": "vehicle_unavailable_or_status_stale"}
-        if not energy["eligible"]:
+        standby_without_drain = (
+            standby_only and energy["reason"] == "insufficient_observed_consumption_history"
+        )
+        if not energy["eligible"] and not standby_without_drain:
             return {"eligible": False, "reason": energy["reason"], "battery_decision": energy}
         created = now.astimezone(timezone.utc)
         expires = created + timedelta(seconds=self.incident_ttl_s)
@@ -449,7 +527,11 @@ class Day10Coordinator:
         return {
             "eligible": True,
             "decision": "proposal_only",
-            "reason": "validated_incident_fresh_vehicle_and_observed_energy_reserve",
+            "reason": (
+                "standby_ack_only_battery_history_unavailable"
+                if standby_without_drain
+                else "validated_incident_fresh_vehicle_and_observed_energy_reserve"
+            ),
             "battery_decision": energy,
             "mission": {
                 "schema_version": "uav-mission-v1", "message_type": "mission_assignment",

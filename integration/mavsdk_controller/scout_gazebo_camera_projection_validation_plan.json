@@ -1,0 +1,92 @@
+{
+  "schema_version": "scout-gazebo-camera-projection-validation-plan-v1",
+  "status": "simulation_ground_truth_references_only_not_camera_calibration",
+  "world": {
+    "name": "earthquake_landslide_world",
+    "spherical_coordinates": {
+      "surface_model": "EARTH_WGS84",
+      "world_frame_orientation": "ENU",
+      "latitude_deg": 27.9881,
+      "longitude_deg": 86.925,
+      "elevation_m": 1450.0
+    },
+    "terrain": {
+      "model_name": "terrain",
+      "world_pose_xyz_m": [
+        -70.0,
+        -56.0,
+        1.62
+      ],
+      "geometry": "mesh",
+      "mesh_uri": "model://earthquake_landslide_assets/meshes/terrain_apron.obj",
+      "collision_mesh_uri": "model://earthquake_landslide_assets/meshes/terrain_apron_collision.obj",
+      "flat_ground_plane_valid": false,
+      "terrain_altitude_for_projection": null,
+      "reason": "Terrain is a mesh; sample terrain collision surface at each target XY."
+    }
+  },
+  "victim_model_origins": [
+    {
+      "model_uri": "model://survivor_female",
+      "world_pose_xyz_m": [
+        -72.6,
+        -54.3,
+        1.659423
+      ],
+      "yaw_rad": 0.3
+    },
+    {
+      "model_uri": "model://survivor_male",
+      "world_pose_xyz_m": [
+        -70.3,
+        -54.2,
+        2.129575
+      ],
+      "yaw_rad": 2.1
+    },
+    {
+      "model_uri": "model://survivor_female",
+      "world_pose_xyz_m": [
+        -68.3,
+        -54.5,
+        2.497331
+      ],
+      "yaw_rad": -0.7
+    },
+    {
+      "model_uri": "model://standing_person_small",
+      "world_pose_xyz_m": [
+        -74.5,
+        -52.5,
+        1.682516
+      ],
+      "yaw_rad": 0.0
+    },
+    {
+      "model_uri": "model://rescue_randy_sitting_small",
+      "world_pose_xyz_m": [
+        -68.0,
+        -52.0,
+        2.155283
+      ],
+      "yaw_rad": 1.2
+    }
+  ],
+  "validation_requirements": [
+    "Resolve each victim model's collision geometry and compute its ground-contact point; do not assume model-origin Z is ground altitude.",
+    "Sample the terrain collision mesh beneath each target XY to obtain local terrain height.",
+    "Use Gazebo camera image acquisition timestamp and interpolated PX4 pose at that timestamp.",
+    "Record camera optical-to-body-FRD transform and validate its axis convention against the SDF joint/link frames.",
+    "Compare projected camera-GPS footpoint against Gazebo ground-truth victim ground-contact coordinates.",
+    "Report horizontal error, vertical/range error, sample count, and uncertainty separately.",
+    "Label results simulation-validated only; they do not constitute real-world empirical calibration.",
+    "Keep coordinator operational calibration approval and dispatchability disabled."
+  ],
+  "not_established_by_this_world_file": [
+    "Camera optical-to-body-FRD empirical extrinsics",
+    "GPS/attitude sensor uncertainty",
+    "Terrain altitude in the PX4 home absolute-altitude datum",
+    "Ground-contact coordinates of victim models",
+    "Real-world calibration validity"
+  ]
+}

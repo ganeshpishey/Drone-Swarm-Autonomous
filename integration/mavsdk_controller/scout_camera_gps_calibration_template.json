@@ -1,0 +1,53 @@
+{
+  "schema_version": "scout-camera-gps-calibration-v1",
+  "calibration_id": "scout-camera-nominal-sdf-template-not-approved",
+  "verification_status": "nominal_sdf_derived_unverified",
+  "verification_evidence": null,
+  "camera_model": "pinhole_nominal_sdf",
+  "distortion_model": "unknown_until_measured",
+  "camera_intrinsics": {
+    "width_px": 1280,
+    "height_px": 960,
+    "horizontal_fov_rad": 1.74,
+    "fx_px": 539.9363680245298,
+    "fy_px": 539.9363680245298,
+    "cx_px": 640.0,
+    "cy_px": 480.0,
+    "derivation": "fx calculated from SDF horizontal_fov; fy assumes square pixels; principal point assumes image centre",
+    "status": "nominal_unverified"
+  },
+  "transforms": {
+    "body_frd_from_camera_optical": null,
+    "status": "not_populated_camera_optical_to_body_frd_transform_requires_verified_frame_convention_and_measurement"
+  },
+  "uncertainty": {
+    "intrinsic_px": null,
+    "extrinsic_translation_m": null,
+    "extrinsic_rotation_rad": null,
+    "status": "not_measured"
+  },
+  "terrain_reference_id": null,
+  "terrain_reference": {
+    "status": "not_independently_validated",
+    "altitude_m": null,
+    "altitude_datum": null,
+    "uncertainty_m": null
+  },
+  "operational_approval": {
+    "approved": false,
+    "approved_calibration_ids": [],
+    "dispatchable": false
+  },
+  "source_files": [
+    "PX4-Autopilot/Tools/simulation/gz/models/mono_cam/model.sdf",
+    "Drone-Swarm/worlds/disaster_assets/models/x500_mono_cam_down_lidar/model.sdf"
+  ],
+  "notes": [
+    "This is a nominal configuration template only, not an operational calibration.",
+    "The SDF provides 1280x960 resolution and horizontal FOV 1.74 rad.",
+    "fy assumes square pixels; confirm with camera calibration.",
+    "Camera optical-to-body FRD transform is intentionally left null rather than guessed.",
+    "Do not pass this file to --camera-gps-calibration: the detector must reject it until empirically verified.",
+    "Do not set terrain altitude to zero by assumption."
+  ]
+}

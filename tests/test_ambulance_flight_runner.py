@@ -108,6 +108,23 @@ class AmbulanceFlightRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["state"], "ARRIVAL_CONFIRMED")
 
 
+    async def test_airborne_continuation_skips_arm_takeoff_and_rtl(self):
+        runner, drone, offboard, lifecycle = self.make_runner(enabled=True)
+        runner.airborne = lambda: True
+        phases = []
+        runner.flight_state_check = lambda phase: phases.append(phase) or {"approved": True}
+
+        result = await runner.run(airborne_continuation=True)
+
+        self.assertEqual(phases, ["airborne", "airborne"])
+        self.assertTrue(result["arrival_confirmed"])
+        drone.action.set_takeoff_altitude.assert_not_awaited()
+        drone.action.arm.assert_not_awaited()
+        drone.action.takeoff.assert_not_awaited()
+        offboard.run.assert_awaited_once()
+        lifecycle.request_rtl.assert_not_awaited()
+
+
 async def empty_stream():
     if False:
         yield None

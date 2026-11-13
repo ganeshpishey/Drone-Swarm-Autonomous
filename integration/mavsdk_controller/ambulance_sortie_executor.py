@@ -21,6 +21,8 @@ class ExecutorConfig:
     max_horizontal_speed_m_s: float = 0.35
     max_relative_altitude_m: float = MAX_RELATIVE_ALTITUDE_M
     arrival_tolerance_m: float = 1.0
+    descent_enabled: bool = False
+    climb_enabled: bool = False
 
     def validate(self) -> None:
         values = (
@@ -49,7 +51,7 @@ class AmbulanceSortieExecutor:
         if guidance is None:
             raise ValueError("guidance is required")
 
-        if guidance.state not in {"GOAL", "DETOUR", "HOLD"}:
+        if guidance.state not in {"GOAL", "DETOUR", "HOLD", "DESCEND", "CLIMB"}:
             raise ValueError(f"unsupported guidance state: {guidance.state}")
 
         values = (
@@ -60,6 +62,23 @@ class AmbulanceSortieExecutor:
         )
         if any(not math.isfinite(value) for value in values):
             raise ValueError("guidance setpoint values must be finite")
+
+        if guidance.state == "CLIMB":
+            if (not self.config.climb_enabled
+                    or guidance.north_m_s != 0 or guidance.east_m_s != 0
+                    or not -0.25 <= guidance.down_m_s < 0):
+                raise ValueError("invalid_or_disabled_climb_setpoint")
+            return VelocityNedYaw(0.0, 0.0, guidance.down_m_s, guidance.yaw_deg)
+
+        if guidance.state == "DESCEND":
+            if (not self.config.descent_enabled
+                    or math.hypot(guidance.north_m_s, guidance.east_m_s) > 0.080001
+                    or not 0 < guidance.down_m_s <= 0.15):
+                raise ValueError("invalid_or_disabled_descent_setpoint")
+            return VelocityNedYaw(
+                guidance.north_m_s, guidance.east_m_s,
+                guidance.down_m_s, guidance.yaw_deg,
+            )
 
         if guidance.state == "HOLD":
             return VelocityNedYaw(

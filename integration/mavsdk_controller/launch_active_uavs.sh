@@ -19,6 +19,57 @@ MVSDK_PYTHON="$PROJECT_ROOT/.venv-mavsdk/bin/python"
 MVSDK_SERVER="$PROJECT_ROOT/.venv-mavsdk/lib/python3.10/site-packages/mavsdk_grpc/bin/mavsdk_server"
 PERCEPTION_PYTHON="$PROJECT_ROOT/.venv-perception/bin/python"
 PERCEPTION_MODEL="$PROJECT_ROOT/yolo26n.pt"
+MODE="${1:-scout-ambulance}"
+FINAL_APPROACH=0
+FINAL_DESCENT=0
+if [[ "$MODE" == "final-five" ]]; then
+  export SCOUT_FIVE_VICTIMS=1
+  export AMBULANCE_CONCURRENT_SITL=1
+fi
+if [[ "$MODE" == "final-descent" || "$MODE" == "final-five" ]]; then
+  FINAL_DESCENT=1
+fi
+if [[ "$MODE" == "final-approach" || "$FINAL_DESCENT" == "1" ]]; then
+  FINAL_APPROACH=1
+fi
+if [[ "$MODE" == "final-standby" || "$MODE" == "final-world" || "$FINAL_APPROACH" == "1" ]]; then
+  # These settings were validated together in the single-victim Gazebo world.
+  export PX4_GZ_WORLD_FILE="$PROJECT_ROOT/worlds/scout_ambulance_standby_world.sdf"
+  export SCOUT_VERIFIED_CALIBRATION="$SCRIPT_DIR/gazebo_standby/camera_gps_calibration.json"
+  export SCOUT_LOCALIZATION_POLICY="$SCRIPT_DIR/gazebo_standby/localization_policy.json"
+  export SCOUT_TERRAIN_ALTITUDE_M=1452.14
+  export SCOUT_TERRAIN_SIGMA_M=0.15
+  export SCOUT_GPS_POSITION_SIGMA_M=0.20
+  export SCOUT_ATTITUDE_SIGMA_RAD=0.08
+  export ENABLE_AMBULANCE_STANDBY_ACCEPTANCE=1
+  export ENABLE_AMBULANCE_FLIGHT_EXECUTION=0
+  if [[ "$MODE" == "final-world" || "$FINAL_APPROACH" == "1" ]]; then
+    export PX4_GZ_WORLD_FILE="$PROJECT_ROOT/worlds/earthquake_landslide_apron_world.sdf"
+    export SCOUT_GAZEBO_TERRAIN_WORLD="$PX4_GZ_WORLD_FILE"
+    export SCOUT_VERIFIED_CALIBRATION="$SCRIPT_DIR/gazebo_standby/full_world_camera_gps_calibration.json"
+    export SCOUT_LOCALIZATION_POLICY="$SCRIPT_DIR/gazebo_standby/full_world_localization_policy.json"
+    unset SCOUT_TERRAIN_ALTITUDE_M
+    if [[ ! -r "$PROJECT_ROOT/worlds/earthquake_landslide_assets/meshes/terrain_apron_collision.obj" ]]; then
+      echo "Missing the original Gazebo terrain collision mesh." >&2
+      exit 1
+    fi
+  else
+    unset SCOUT_GAZEBO_TERRAIN_WORLD
+  fi
+  for file in "$PX4_GZ_WORLD_FILE" "$SCOUT_VERIFIED_CALIBRATION" "$SCOUT_LOCALIZATION_POLICY"; do
+    if [[ ! -r "$file" ]]; then
+      echo "Missing final standby configuration: $file" >&2
+      exit 1
+    fi
+  done
+  if [[ "$FINAL_APPROACH" == "1" ]]; then
+    export ENABLE_AMBULANCE_FLIGHT_EXECUTION=1
+    echo "$MODE: Gazebo SITL approach, then return and land."
+  else
+    echo "$MODE: live Scout GPS, localhost mission handoff, Ambulance standby."
+  fi
+  MODE=scout-ambulance
+fi
 WORLD_SOURCE="$(/usr/bin/python3 "$SCRIPT_DIR/gazebo_world_identity.py" select \
   --override "${PX4_GZ_WORLD_FILE:-}" \
   --default "$PROJECT_ROOT/worlds/earthquake_landslide_apron_world.sdf")"
@@ -27,11 +78,10 @@ WORLD_NAME="earthquake_landslide_world"
 BASE_DIR="${TMPDIR:-/tmp}/drone-swarm-active-uavs-${UID}"
 CURRENT_LINK="$BASE_DIR/current"
 LOCK_FILE="$BASE_DIR/launch.lock"
-MODE="${1:-scout-ambulance}"
 
 usage() {
   cat <<'USAGE'
-Usage: launch_active_uavs.sh [telemetry-only|scout-only|ambulance-only|scout-ambulance|integrated-safe|preflight-only|stop]
+Usage: launch_active_uavs.sh [telemetry-only|scout-only|ambulance-only|scout-ambulance|final-standby|final-world|final-approach|final-descent|final-five|integrated-safe|preflight-only|stop]
 
 Starts only Scout, only Ambulance, or both. A Scout-plus-Ambulance run also
 starts the Day 10 coordinator, direct localhost UDP agents, Scout camera/YOLO,
@@ -40,6 +90,12 @@ process groups. Per-run logs and staged files are retained under /tmp. The
 preflight-only mode performs the same checks for the pair and exits without
 starting PX4 or Gazebo. telemetry-only starts Scout PX4 and MAVSDK only;
 it does not start perception, survey, coordinator, or Ambulance.
+final-standby loads the validated single-victim Gazebo preset and enables
+Ambulance standby acknowledgement. final-world uses the original multi-victim
+world and projects each detection onto its collision terrain.
+final-approach runs one Gazebo SITL approach and return using the same world.
+final-descent adds a downward-LiDAR-checked descent before return.
+final-five starts the concurrent five-victim SITL survey and Ambulance sortie.
 USAGE
 }
 
@@ -965,11 +1021,27 @@ start_day10_runtime() {
   local coordinator_log="$RUN_DIR/logs/coordinator.log"
   local perception_output="$RUN_DIR/perception"
   local standby_coordinator_args=()
+  local localization_policy_args=()
+  if [[ -n "${SCOUT_LOCALIZATION_POLICY:-}" ]]; then
+    localization_policy_args+=(--localization-policy "$SCOUT_LOCALIZATION_POLICY")
+  fi
   local standby_agent_args=()
+  local ambulance_flight_args=()
   if [[ "${ENABLE_AMBULANCE_STANDBY_ACCEPTANCE:-0}" == "1" ]]; then
     standby_coordinator_args+=(--allow-ambulance-standby-ack)
     standby_agent_args+=(--accept-ambulance-standby)
-    echo "Ambulance standby ACK enabled; flight execution remains disabled."
+    echo "Ambulance standby ACK enabled."
+  fi
+  if [[ "$MODE" == "scout-ambulance" && "${ENABLE_AMBULANCE_FLIGHT_EXECUTION:-0}" == "1" ]]; then
+    ambulance_flight_args+=(--enable-ambulance-flight-execution)
+    if [[ "$FINAL_APPROACH" == "1" ]]; then
+      ambulance_flight_args+=(--sitl-planning-drain-percent-per-minute 5
+        --reserve-battery-percent 50 --mission-ttl-s 120 --sitl-approach-demo)
+      if [[ "$FINAL_DESCENT" == "1" ]]; then
+        ambulance_flight_args+=(--sitl-descent-demo)
+      fi
+    fi
+    echo "WARNING: Ambulance SITL flight execution explicitly enabled."
   fi
   mkdir -p "$runtime" "$perception_output"
   cat >"$runtime/coordinator_peers.json" <<'JSON'
@@ -1001,7 +1073,9 @@ JSON
     --component-log "$RUN_DIR/logs/scout_camera_yolo.log" \
     --component-log "$RUN_DIR/logs/scout_manet_bridge.log" \
     --component-log "$RUN_DIR/logs/ambulance_manet_agent.log" \
-    "${standby_coordinator_args[@]}"
+    "${localization_policy_args[@]}" \
+    "${standby_coordinator_args[@]}" \
+    "${ambulance_flight_args[@]}"
   local coordinator_pid="${AUX_PIDS[-1]}"
   wait_auxiliary_ready coordinator "$coordinator_pid" "$coordinator_log" '\[COORDINATOR ONLINE\]' 
 
@@ -1035,7 +1109,12 @@ JSON
     --output-dir "$perception_output" --interval 5 --imgsz 960 --conf 0.25 \
     --pose-log "$runtime/coordinator_navigation_history.json" \
     --sdf-calibration-report "$SCOUT_SDF_CALIBRATION_REPORT" \
-    ${SCOUT_VERIFIED_CALIBRATION:+--calibration "$SCOUT_VERIFIED_CALIBRATION"}
+    ${SCOUT_VERIFIED_CALIBRATION:+--camera-gps-calibration "$SCOUT_VERIFIED_CALIBRATION"} \
+    ${SCOUT_GAZEBO_TERRAIN_WORLD:+--gazebo-terrain-world "$SCOUT_GAZEBO_TERRAIN_WORLD"} \
+    ${SCOUT_TERRAIN_ALTITUDE_M:+--terrain-altitude-m "$SCOUT_TERRAIN_ALTITUDE_M"} \
+    ${SCOUT_TERRAIN_SIGMA_M:+--terrain-sigma-m "$SCOUT_TERRAIN_SIGMA_M"} \
+    ${SCOUT_GPS_POSITION_SIGMA_M:+--gps-position-sigma-m "$SCOUT_GPS_POSITION_SIGMA_M"} \
+    ${SCOUT_ATTITUDE_SIGMA_RAD:+--attitude-sigma-rad "$SCOUT_ATTITUDE_SIGMA_RAD"}
   local perception_pid="${AUX_PIDS[-1]}"
   wait_auxiliary_ready scout-camera-yolo "$perception_pid" \
     "$RUN_DIR/logs/scout_camera_yolo.log" 'Listening for Scout Gazebo Image messages'
@@ -1118,10 +1197,14 @@ if [[ "$MODE" == "scout-ambulance" ]]; then
     exit 1
   fi
 
+  BATTERY_VALIDATION_ARGS=()
+  if [[ "$FINAL_APPROACH" == "1" ]]; then
+    BATTERY_VALIDATION_ARGS+=(--require-enabled)
+  fi
   echo "Applying battery model: 2400-second drain interval, 50% reserve."
   env -u PYTHONPATH -u PYTHONHOME \
     "$BATTERY_PYTHON" "$SCRIPT_DIR/set_swarm_battery_drain.py" \
-    --config "$CONFIG" --drain-seconds 2400 --reserve-percent 50 \
+    --config "$CONFIG" --drain-seconds 2400 --reserve-percent 50 "${BATTERY_VALIDATION_ARGS[@]}" \
     2>&1 | tee "$RUN_DIR/logs/battery_config.log"
 fi
 

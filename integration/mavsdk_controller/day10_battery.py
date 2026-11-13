@@ -180,7 +180,7 @@ def assess_mission_energy(
     return_minutes: float,
     policy: BatteryPolicy | None = None,
 ) -> dict[str, Any]:
-    """Fail closed unless fresh observed drain supports the whole sortie + reserve."""
+    """Require fresh charge and a supported energy estimate for the sortie."""
     policy = policy or BatteryPolicy()
     durations = (outbound_minutes, task_minutes, return_minutes)
     if any(not math.isfinite(v) or v < 0 for v in durations):
@@ -195,16 +195,22 @@ def assess_mission_energy(
         return {"eligible": False, "decision": "safe_landing_recommended", "reason": "critical_battery", "estimated_sortie_use_percent": None}
     if percent <= policy.low_percent:
         return {"eligible": False, "decision": "return_home_recommended", "reason": "low_battery", "estimated_sortie_use_percent": None}
+    source = "observed"
     if (not isinstance(drain, (int, float)) or isinstance(drain, bool)
             or not math.isfinite(drain) or drain <= 0):
-        return {"eligible": False, "decision": "hold_assignment", "reason": "insufficient_observed_consumption_history", "estimated_sortie_use_percent": None}
+        drain = status.get("sitl_planning_drain_percent_per_minute")
+        source = "sitl_planning_bound"
+        if (not isinstance(drain, (int, float)) or isinstance(drain, bool)
+                or not math.isfinite(drain) or drain <= 0):
+            return {"eligible": False, "decision": "hold_assignment", "reason": "insufficient_observed_consumption_history", "estimated_sortie_use_percent": None}
     consumption = drain * total
     reserve_after = float(percent) - consumption
     eligible = reserve_after >= policy.reserve_percent
     return {
         "eligible": eligible,
         "decision": "assignment_allowed" if eligible else "return_home_recommended",
-        "reason": "observed_energy_estimate_with_reserve" if eligible else "estimated_sortie_would_breach_reserve",
+        "reason": (f"{source}_energy_estimate_with_reserve" if eligible
+                   else "estimated_sortie_would_breach_reserve"),
         "estimated_sortie_use_percent": consumption,
         "estimated_percent_after_sortie": reserve_after,
         "required_reserve_percent": policy.reserve_percent,

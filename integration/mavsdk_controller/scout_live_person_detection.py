@@ -40,6 +40,7 @@ import torch
 from ultralytics import YOLO
 
 from scout_udp_protocol import send_report_with_ack
+from scout_gazebo_terrain import GazeboTerrain
 try:
     from .scout_perception_runtime import BoundedPerceptionOutputWriter, PtsOrderTracker
 except ImportError:
@@ -50,26 +51,15 @@ except ImportError:  # direct script execution from the controller directory
     from scout_gz_image_source import GazeboScoutImageSource, image_message_to_bgr
 
 try:
-    from .scout_lidar_projection import associate_lidar_points_to_boxes
-except ImportError:
-    from scout_lidar_projection import associate_lidar_points_to_boxes
-
-try:
-    from .scout_calibration_sync import (
-        localize_gazebo_measurements,
-        interpolate_separate_navigation_streams,
-    )
-    from .scout_3d_localization import validate_calibration
+    from .scout_calibration_sync import interpolate_separate_navigation_streams
     from .scout_camera_ground_projection import project_bbox_to_ground
     from .day10_coordinate_frames import approximate_local_ned_to_geodetic
+    from .scout_camera_gps_localization import AcquisitionPose, LocalizationError, project_detection_to_gps
 except ImportError:
-    from scout_calibration_sync import (
-        localize_gazebo_measurements,
-        interpolate_separate_navigation_streams,
-    )
-    from scout_3d_localization import validate_calibration
+    from scout_calibration_sync import interpolate_separate_navigation_streams
     from scout_camera_ground_projection import project_bbox_to_ground
     from day10_coordinate_frames import approximate_local_ned_to_geodetic
+    from scout_camera_gps_localization import AcquisitionPose, LocalizationError, project_detection_to_gps
 
 
 INCIDENT_LABELS = {
@@ -84,6 +74,42 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _maximum_pose_bracket_s(pose: dict[str, Any]) -> float:
+    """Read the widest source bracket from interpolation provenance."""
+    details = pose.get("pose_interpolation") or {}
+    if details.get("method") == "independent_position_and_attitude_interpolation":
+        brackets = (details.get("position_bracket_s"), details.get("attitude_bracket_s"))
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not np.isfinite(value) or value < 0
+            for value in brackets
+        ):
+            raise ValueError("invalid_position_or_attitude_pose_bracket")
+        return max(brackets)
+
+    gaps: list[float] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            gap = value.get("bracket_s")
+            if isinstance(gap, (int, float)) and np.isfinite(gap):
+                gaps.append(float(gap))
+            times = value.get("source_times_s")
+            if isinstance(times, (list, tuple)) and len(times) >= 2:
+                try:
+                    gaps.append(abs(float(times[-1]) - float(times[0])))
+                except (TypeError, ValueError):
+                    pass
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    visit(details)
+    return max(gaps, default=0.0)
+
+
 def attach_approximate_camera_locations(
     detections: list[dict[str, Any]],
     *,
@@ -93,19 +119,33 @@ def attach_approximate_camera_locations(
     image_frame: Any,
     image_width: int,
     image_height: int,
-    ground_down_m: float = 0.0,
+    ground_down_m: float | None = None,
     maximum_pose_bracket_s: float = 0.2,
+    camera_gps_calibration: dict[str, Any] | None = None,
+    terrain_altitude_m: float | None = None,
+    gazebo_terrain: GazeboTerrain | None = None,
+    terrain_sigma_m: float | None = None,
+    gps_position_sigma_m: float | None = None,
+    attitude_sigma_rad: float | None = None,
 ) -> dict[str, Any]:
-    """Attach approximate GPS observations without creating dispatch coordinates."""
-    result = {"status": "unavailable", "localized_person_count": 0}
+    """Project person footpoints using verified camera calibration + capture-time GPS.
 
+    Candidate projections are always non-dispatchable here. The coordinator
+    independently decides whether a candidate is approved for dispatch.
+    """
+    result = {"status": "unavailable", "localized_person_count": 0}
     if (
-        projection_config is None
+        camera_gps_calibration is None
         or pose_log is None
         or gazebo_source is None
         or image_frame is None
     ):
-        result["reason"] = "camera_projection_or_pose_source_unavailable"
+        result["reason"] = "verified_camera_gps_calibration_or_pose_source_unavailable"
+        return result
+    if (terrain_altitude_m is None and gazebo_terrain is None) or any(
+        value is None for value in (terrain_sigma_m, gps_position_sigma_m, attitude_sigma_rad)
+    ):
+        result["reason"] = "terrain_or_pose_uncertainty_not_configured"
         return result
 
     try:
@@ -118,114 +158,203 @@ def attach_approximate_camera_locations(
             or not origin_id or home_origin is None
         ):
             raise ValueError("scout_navigation_streams_or_home_origin_unavailable")
-
         if home_origin.get("home_id") != origin_id:
             raise ValueError("home_origin_does_not_match_pose_history")
 
         clock_state = gazebo_source.localization_clock_snapshot()
-        mapping = clock_state["clock_mapper"].to_monotonic(
-            float(image_frame.sim_time_s)
-        )
+        mapping = clock_state["clock_mapper"].to_monotonic(float(image_frame.sim_time_s))
         if mapping.get("valid") is not True:
             raise ValueError(
                 f"image_clock_mapping_rejected:{mapping.get('reason', 'invalid')}"
             )
-
         capture_monotonic_s = float(mapping["host_monotonic_s"])
         residual_s = float(mapping["mapping_residual_bound_s"])
         if not np.isfinite([capture_monotonic_s, residual_s]).all():
             raise ValueError("non_finite_image_clock_mapping")
 
-        pose = interpolate_separate_navigation_streams(
-            position_history,
-            attitude_history,
-            capture_monotonic_s,
-            maximum_bracket_s=maximum_pose_bracket_s,
-        )
+        # A detection can finish before the coordinator publishes the pose
+        # sample after capture. Give the history writer time to catch up.
+        pose_retry_deadline = time.monotonic() + 4.5
+        has_person = any(item.get("type") == "person" for item in detections)
+        while True:
+            pose = interpolate_separate_navigation_streams(
+                position_history, attitude_history, capture_monotonic_s,
+                maximum_bracket_s=maximum_pose_bracket_s,
+            )
+            if pose is not None or not has_person:
+                break
+            if all(max(sample["host_monotonic_s"] for sample in history)
+                   >= capture_monotonic_s
+                   for history in (position_history, attitude_history)):
+                break
+            remaining = pose_retry_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
+            new_positions, new_attitudes, new_origin = (
+                read_coordinator_navigation_streams(pose_log, "scout_0")
+            )
+            if new_origin and new_origin != origin_id:
+                raise ValueError("scout_pose_origin_changed_during_capture")
+            if new_positions and new_attitudes and new_origin == origin_id:
+                position_history, attitude_history = new_positions, new_attitudes
         if pose is None:
             raise ValueError("no_pose_bracket_at_camera_acquisition_time")
         if pose.get("coordinate_origin_id") != origin_id:
             raise ValueError("interpolated_pose_origin_mismatch")
+        pose_monotonic_s = float(
+            pose.get("host_monotonic_s", float("nan"))
+        )
+        if (
+            not np.isfinite(pose_monotonic_s)
+            or abs(pose_monotonic_s - capture_monotonic_s) > 1e-9
+        ):
+            raise ValueError(
+                "interpolated_pose_timestamp_does_not_match_image_capture"
+            )
 
-        intrinsics = dict(projection_config["camera_intrinsics"])
-        nominal_width = int(intrinsics["width_px"])
-        nominal_height = int(intrinsics["height_px"])
-        if nominal_width <= 0 or nominal_height <= 0:
-            raise ValueError("invalid_nominal_camera_dimensions")
+        sensor_timestamps = {
+            "image_capture": capture_monotonic_s,
+            "scout_pose": pose_monotonic_s,
+        }
+        pose_age_s = abs(capture_monotonic_s - pose_monotonic_s)
 
-        # Scale nominal intrinsics only when the image aspect ratio is unchanged.
+        bracket_s = _maximum_pose_bracket_s(pose)
+        if bracket_s > maximum_pose_bracket_s + 1e-9:
+            raise ValueError("pose_bracket_exceeds_camera_gps_limit")
+        if residual_s > 0.01:
+            raise ValueError("camera_clock_mapping_uncertainty_exceeds_10ms")
+
+        # Convert the interpolated Scout local-NED pose to WGS84 using its
+        # current PX4 home origin. Altitude uses the same absolute datum.
+        vehicle_geo = approximate_local_ned_to_geodetic(
+            [pose["north_m"], pose["east_m"], pose["down_m"]],
+            home_origin=home_origin,
+            expected_vehicle_id="scout_0",
+            coordinate_origin_id=origin_id,
+        )
+        home_altitude = float(home_origin["absolute_altitude_m"])
+        vehicle_altitude = home_altitude - float(pose["down_m"])
+
+        intrinsics = dict(camera_gps_calibration["camera_intrinsics"])
+        nominal_width, nominal_height = int(intrinsics["width_px"]), int(intrinsics["height_px"])
         if image_width <= 0 or image_height <= 0:
             raise ValueError("invalid_camera_image_dimensions")
-        if abs((image_width / image_height) -
-               (nominal_width / nominal_height)) > 1e-6:
+        if abs(image_width / image_height - nominal_width / nominal_height) > 1e-6:
             raise ValueError("camera_image_aspect_ratio_differs_from_calibration")
+        sx, sy = image_width / nominal_width, image_height / nominal_height
+        intrinsics["fx_px"] = float(intrinsics["fx_px"]) * sx
+        intrinsics["cx_px"] = float(intrinsics["cx_px"]) * sx
+        intrinsics["fy_px"] = float(intrinsics["fy_px"]) * sy
+        intrinsics["cy_px"] = float(intrinsics["cy_px"]) * sy
+        intrinsics["width_px"], intrinsics["height_px"] = image_width, image_height
 
-        scale_x = image_width / nominal_width
-        scale_y = image_height / nominal_height
-        for key in ("fx_px", "cx_px"):
-            intrinsics[key] = float(intrinsics[key]) * scale_x
-        for key in ("fy_px", "cy_px"):
-            intrinsics[key] = float(intrinsics[key]) * scale_y
-        intrinsics["width_px"] = image_width
-        intrinsics["height_px"] = image_height
+        calibration_for_frame = dict(camera_gps_calibration)
+        calibration_for_frame["camera_intrinsics"] = intrinsics
+
+        pose_input = AcquisitionPose(
+            latitude_deg=float(vehicle_geo["latitude_deg"]),
+            longitude_deg=float(vehicle_geo["longitude_deg"]),
+            altitude_m=vehicle_altitude,
+            roll_rad=float(pose["roll_rad"]),
+            pitch_rad=float(pose["pitch_rad"]),
+            yaw_rad=float(pose["yaw_rad"]),
+            position_sigma_m=float(gps_position_sigma_m),
+            attitude_sigma_rad=float(attitude_sigma_rad),
+            capture_monotonic_s=capture_monotonic_s,
+            pose_origin_id=origin_id,
+            pose_bracket_s=bracket_s,
+            clock_mapping_sigma_s=residual_s,
+        )
 
         for detection in detections:
             if detection.get("type") != "person":
                 continue
-            if detection.get("dispatchable") is True:
+            try:
+                projection = project_detection_to_gps(
+                    detection,
+                    calibration_for_frame,
+                    pose_input,
+                    terrain_altitude_m=terrain_altitude_m,
+                    terrain_sigma_m=terrain_sigma_m,
+                    terrain_intersection=gazebo_terrain.intersection_distance if gazebo_terrain else None,
+                    maximum_pose_bracket_s=maximum_pose_bracket_s,
+                    maximum_clock_sigma_s=0.01,
+                )
+            except LocalizationError as exc:
+                detection["rejection_reason"] = str(exc)
                 continue
-
-            projection = project_bbox_to_ground(
-                detection,
-                intrinsics=intrinsics,
-                body_frd_from_camera_optical=(
-                    projection_config["body_frd_from_camera_optical"]
-                ),
-                pose_ned=pose,
-                ground_down_m=ground_down_m,
-            )
-
-            if not projection.get("approximate_local_ned_m"):
-                detection["approximate_location"] = {
-                    **projection,
-                    "dispatchable": False,
-                    "ground_truth": False,
-                }
-                continue
-
-            gps = approximate_local_ned_to_geodetic(
-                projection["approximate_local_ned_m"],
-                home_origin=home_origin,
-                expected_vehicle_id="scout_0",
-                coordinate_origin_id=origin_id,
-            )
-            detection["approximate_location"] = {
-                **projection,
-                **gps,
+            provenance = {
+                **projection.get("transformation_provenance", {}),
+                "calibration_id": projection["calibration_id"],
+                "calibration_status": "empirically_verified",
+                "camera_model": "pinhole",
+                "camera_mount_transform_status": "empirically_verified",
+                "terrain_reference_status": "independently_validated",
+                "terrain_reference_id": camera_gps_calibration.get("terrain_reference_id"),
+                "pose_interpolation_status": "bracketed_at_image_acquisition",
+                "timestamp_domain": "host_monotonic_capture",
                 "image_acquisition_sim_s": float(image_frame.sim_time_s),
-                "host_monotonic_capture_s": capture_monotonic_s,
-                "clock_mapping_residual_bound_s": residual_s,
-                "pose_interpolation": pose.get("pose_interpolation"),
-                "camera_calibration_status": "nominal_sdf_derived_unverified",
+                "camera_capture_monotonic_s": capture_monotonic_s,
+                "sensor_timestamps_monotonic_s": sensor_timestamps,
+                "pose_age_s": pose_age_s,
+                "clock_mapping_sigma_s": residual_s,
+                "pose_bracket_s": bracket_s,
+                "coordinate_origin_id": origin_id,
+                "reference_vehicle_id": "scout_0",
+                "depth_status": "not_used_for_victim_localization",
+            }
+            candidate = {
+                **projection,
+                "camera_gps_provenance": provenance,
+                "localization_status": "candidate",
+                "location_status": "camera_gps_projected",
+                "coordinate_frame": "wgs84_geodetic",
+                "coordinate_origin_id": origin_id,
+                "reference_vehicle_id": "scout_0",
                 "dispatchable": False,
                 "ground_truth": False,
             }
+            detection["camera_gps_candidate"] = candidate
+            detection["camera_gps_provenance"] = provenance
+            detection["sensor_timestamps_monotonic_s"] = sensor_timestamps
+            detection["coordinate_frame"] = "wgs84_geodetic"
+            detection["latitude_deg"] = projection["latitude_deg"]
+            detection["longitude_deg"] = projection["longitude_deg"]
+            detection["altitude_m"] = projection["altitude_m"]
+            detection["coordinate_origin_id"] = origin_id
+            detection["reference_vehicle_id"] = "scout_0"
+            detection["location_status"] = "camera_gps_projected"
+            detection["localization_status"] = "candidate"
+            detection["localization_uncertainty_m"] = projection["localization_uncertainty_m"]
+            detection["dispatchable"] = False
             result["localized_person_count"] += 1
 
+        if result["localized_person_count"] == 0:
+            result["reason"] = next(
+                (item.get("rejection_reason") for item in detections if item.get("type") == "person"),
+                "no_person_detection",
+            )
+            return result
+
         result.update({
-            "status": "approximate",
+            "status": "camera_gps_candidate",
+            "coordinate_frame": "wgs84_geodetic",
             "coordinate_origin_id": origin_id,
+            "reference_vehicle_id": "scout_0",
             "image_acquisition_sim_s": float(image_frame.sim_time_s),
             "host_monotonic_capture_s": capture_monotonic_s,
             "clock_mapping_residual_bound_s": residual_s,
+            "pose_bracket_s": bracket_s,
+            "dispatchable": False,
         })
         return result
 
-    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, LocalizationError) as exc:
         result["reason"] = str(exc)
         for detection in detections:
             if detection.get("type") == "person":
-                detection.setdefault("approximate_location", {
+                detection.setdefault("camera_gps_candidate", {
                     "localization_status": "unlocalized",
                     "location_status": "unlocalized",
                     "dispatchable": False,
@@ -398,9 +527,23 @@ def main() -> int:
         help="Coordinator navigation history JSON used for synchronized local-NED pose interpolation.",
     )
     parser.add_argument(
-        "--calibration", type=Path,
-        help="Empirically verified scout-rgb-lidar-calibration-v1 JSON. Nominal SDF reports are not accepted.",
+        "--ground-down-m", type=float,
+        help=("Explicit terrain plane down-coordinate in Scout local NED metres. "
+              "Without this value, camera projection remains unavailable."),
     )
+    parser.add_argument(
+        "--camera-gps-calibration", type=Path,
+        help="Empirically verified camera-GPS calibration JSON (not the nominal SDF report).",
+    )
+    parser.add_argument("--gazebo-terrain-world", type=Path)
+    parser.add_argument("--terrain-altitude-m", type=float,
+                        help="Validated terrain altitude in the PX4 home absolute-altitude datum.")
+    parser.add_argument("--terrain-sigma-m", type=float,
+                        help="Validated terrain altitude uncertainty in metres.")
+    parser.add_argument("--gps-position-sigma-m", type=float,
+                        help="Conservative acquisition-time GPS position uncertainty in metres.")
+    parser.add_argument("--attitude-sigma-rad", type=float,
+                        help="Conservative acquisition-time attitude uncertainty in radians.")
     parser.add_argument("--pose-max-delta-s", type=float, default=1.0)
     parser.add_argument(
         "--coordinator-host",
@@ -414,7 +557,33 @@ def main() -> int:
     parser.add_argument("--coordinator-ack-timeout-s", type=float, default=0.25)
     args = parser.parse_args()
 
+    gazebo_terrain = None
+    if args.gazebo_terrain_world is not None:
+        if args.input_source != "gazebo-image" or args.terrain_altitude_m is not None:
+            parser.error("Gazebo terrain requires direct images and no fixed terrain altitude")
+        try:
+            gazebo_terrain = GazeboTerrain(args.gazebo_terrain_world)
+        except (OSError, ValueError, AttributeError, IndexError, TypeError) as exc:
+            parser.error(f"invalid Gazebo terrain: {exc}")
+
     projection_config = None
+    camera_gps_calibration = None
+    if args.camera_gps_calibration is not None:
+        try:
+            camera_gps_calibration = json.loads(
+                args.camera_gps_calibration.read_text(encoding="utf-8")
+            )
+            if not isinstance(camera_gps_calibration, dict):
+                raise ValueError("camera-GPS calibration must be a JSON object")
+            if camera_gps_calibration.get("schema_version") != "scout-camera-gps-calibration-v1":
+                raise ValueError("camera-GPS calibration schema is invalid")
+            if camera_gps_calibration.get("verification_status") != "empirically_verified":
+                raise ValueError("camera-GPS calibration is not empirically verified")
+            if not camera_gps_calibration.get("terrain_reference_id"):
+                raise ValueError("calibration must identify its independently validated terrain reference")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(f"invalid camera-GPS calibration: {exc}")
+
     if args.sdf_calibration_report is not None:
         try:
             sdf_report = json.loads(
@@ -481,8 +650,6 @@ def main() -> int:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             parser.error(f"invalid SDF calibration report: {exc}")
 
-    if args.calibration is not None and not args.calibration.is_file():
-        parser.error(f"verified calibration file not found: {args.calibration}")
     if args.interval <= 0:
         parser.error("--interval must be greater than zero")
     if args.max_inferences < 0:
@@ -672,108 +839,25 @@ def main() -> int:
             )
             last_inference_completed_monotonic = inference_completed_monotonic
 
-            projection_results = None
-            if (
-                gazebo_source is not None
-                and projection_config is not None
-                and isinstance(pointcloud_snapshot, dict)
-                and pointcloud_snapshot.get("synchronization_status")
-                    == "temporally_paired_unverified"
-                and pointcloud_snapshot.get("pointcloud_frame_id") == "lidar_link"
-                and pointcloud_snapshot.get("points_xyz_sensor_m") is not None
-            ):
-                projection_results = associate_lidar_points_to_boxes(
-                    detections,
-                    pointcloud_snapshot["points_xyz_sensor_m"],
-                    camera_intrinsics=projection_config["camera_intrinsics"],
-                    camera_optical_from_lidar=projection_config[
-                        "camera_optical_from_lidar"
-                    ],
-                    lidar_frame_id=pointcloud_snapshot["pointcloud_frame_id"],
-                )
-
-            if projection_results is not None:
-                if len(projection_results) != len(detections):
-                    raise RuntimeError(
-                        "LiDAR projection returned a different number "
-                        "of results than YOLO detections"
-                    )
-                for detection, diagnostic in zip(detections, projection_results):
-                    detection.update(diagnostic)
-                    # Explicit safety overrides: diagnostic projection is
-                    # never a dispatchable or ground-truth location.
-                    detection["dispatchable"] = False
-                    detection["ground_truth"] = False
-
-            localization_failure = "verified_calibration_not_configured"
-            localization_results = None
-            calibration = None
-
-            if args.calibration is not None:
-                try:
-                    with args.calibration.open(encoding="utf-8") as stream:
-                        calibration = json.load(stream)
-                    validate_calibration(calibration)
-                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    localization_failure = f"calibration_rejected:{exc}"
-                    calibration = None
-
-            if (
-                gazebo_source is not None
-                and calibration is not None
-                and detections
-                and isinstance(pointcloud_snapshot, dict)
-                and pointcloud_snapshot.get("original_message") is not None
-                and pointcloud_snapshot.get("points_xyz_sensor_m") is not None
-            ):
-                pose_history, origin_id = read_coordinator_pose_history(args.pose_log)
-                if pose_history and origin_id:
-                    clock_state = gazebo_source.localization_clock_snapshot()
-                    try:
-                        localization_results = localize_gazebo_measurements(
-                            detections,
-                            pointcloud_snapshot["points_xyz_sensor_m"],
-                            image_message=image_frame.message,
-                            lidar_message=pointcloud_snapshot["original_message"],
-                            now_sim_time_s=clock_state["current_sim_time_s"],
-                            now_monotonic_s=time.monotonic(),
-                            pose_history=pose_history,
-                            clock_mapper=clock_state["clock_mapper"],
-                            calibration=calibration,
-                            coordinate_origin_id=origin_id,
-                            sensor_epoch=clock_state["sensor_epoch"],
-                            maximum_sensor_age_s=args.maximum_sensor_age_s,
-                        )
-                    except (ValueError, TypeError, KeyError, RuntimeError) as exc:
-                        localization_failure = f"localization_error:{exc}"
-                else:
-                    localization_failure = (
-                        "coordinator_pose_history_unavailable_or_origin_mismatch"
-                    )
-
-            if localization_results is not None:
-                if len(localization_results) != len(detections):
-                    raise RuntimeError(
-                        "Localization returned a different number of results "
-                        "than YOLO detections"
-                    )
-                for detection, localized in zip(detections, localization_results):
-                    detector_confidence = detection["confidence"]
-                    detection.update(localized)
-                    detection["detector_confidence"] = detector_confidence
-                    detection["ground_truth"] = False
-            else:
-                for detection in detections:
-                    detection.update({
-                        "depth_status": detection.get("depth_status", "unavailable"),
-                        "localization_status": "unlocalized",
-                        "location_status": "unlocalized",
-                        "dispatchable": False,
-                        "localization_uncertainty_m": None,
-                        "rejection_reason": localization_failure,
-                        "incident_world_location": None,
-                        "ground_truth": False,
-                    })
+            # Victim localization is camera + acquisition-time GPS/attitude only.
+            # LiDAR remains a separate obstacle-avoidance sensor and is never
+            # associated with YOLO boxes or used to estimate victim coordinates.
+            localization_failure = (
+                "camera_gps_projection_unavailable_or_unverified"
+                if gazebo_source is not None else
+                "rtp_has_no_proven_gazebo_image_acquisition_time"
+            )
+            for detection in detections:
+                detection.update({
+                    "depth_status": "not_used_for_victim_localization",
+                    "localization_status": "unlocalized",
+                    "location_status": "unlocalized",
+                    "dispatchable": False,
+                    "localization_uncertainty_m": None,
+                    "rejection_reason": localization_failure,
+                    "incident_world_location": None,
+                    "ground_truth": False,
+                })
 
             camera_projection_summary = attach_approximate_camera_locations(
                 detections,
@@ -783,8 +867,14 @@ def main() -> int:
                 image_frame=image_frame,
                 image_width=width,
                 image_height=height,
-                ground_down_m=0.0,
+                ground_down_m=args.ground_down_m,
                 maximum_pose_bracket_s=min(args.pose_max_delta_s, 0.2),
+                camera_gps_calibration=camera_gps_calibration,
+                terrain_altitude_m=args.terrain_altitude_m,
+                gazebo_terrain=gazebo_terrain,
+                terrain_sigma_m=args.terrain_sigma_m,
+                gps_position_sigma_m=args.gps_position_sigma_m,
+                attitude_sigma_rad=args.attitude_sigma_rad,
             )
 
             for detection in detections:
@@ -815,17 +905,32 @@ def main() -> int:
             if gazebo_source is not None:
                 processing["image_age_at_decode_start_sim_s"] = frame_metadata["image_to_lidar_sync"].get("image_age_sim_s")
             has_approximate_gps = any(
-                isinstance(item.get("approximate_location"), dict)
-                and item["approximate_location"].get("location_status") == "approximate"
-                and isinstance(item["approximate_location"].get("latitude_deg"), (int, float))
-                and isinstance(item["approximate_location"].get("longitude_deg"), (int, float))
-                and item.get("dispatchable") is False
+                (
+                    isinstance(item.get("approximate_location"), dict)
+                    and item["approximate_location"].get("location_status") == "approximate_observation"
+                    and isinstance(item["approximate_location"].get("latitude_deg"), (int, float))
+                    and isinstance(item["approximate_location"].get("longitude_deg"), (int, float))
+                    and item.get("dispatchable") is False
+                ) or (
+                    isinstance(item.get("camera_gps_candidate"), dict)
+                    and item["camera_gps_candidate"].get("location_status") == "camera_gps_projected"
+                    and item.get("dispatchable") is False
+                )
                 for item in detections
             )
             has_validated_location = any(
                 item.get("location_status") == "validated"
                 and item.get("dispatchable") is True
                 for item in detections
+            )
+            camera_gps_candidate = next(
+                (
+                    item["camera_gps_candidate"]
+                    for item in detections
+                    if isinstance(item.get("camera_gps_candidate"), dict)
+                    and item["camera_gps_candidate"].get("coordinate_frame") == "wgs84_geodetic"
+                ),
+                None,
             )
             incident_location_status = (
                 "validated" if has_validated_location
@@ -853,12 +958,7 @@ def main() -> int:
                             for item in detections
                         ) else "unlocalized"
                     ),
-                    "depth_status": (
-                        "associated" if any(
-                            item.get("depth_status") == "associated"
-                            for item in detections
-                        ) else "unavailable"
-                    ),
+                    "depth_status": "not_used_for_victim_localization",
                     "dispatchable": any(
                         item.get("dispatchable") is True for item in detections
                     ),
@@ -883,14 +983,28 @@ def main() -> int:
                 "camera_message_type": "gz.msgs.Image" if gazebo_source is not None else "RTP/H264",
                 "camera_source_diagnostics": gazebo_source.diagnostic_counters()
                     if gazebo_source is not None else None,
+                "runtime_camera_info": (
+                    gazebo_source.camera_info_snapshot()
+                    if gazebo_source is not None else None
+                ),
                 "frame_width": width,
                 "frame_height": height,
-                "coordinate_frame": "image_pixels",
+                "coordinate_frame": (
+                    "wgs84_geodetic" if camera_gps_candidate else "image_pixels"
+                ),
                 "detections": detections,
                 "pose_sync_status": pose["status"],
                 "camera_projection": camera_projection_summary,
                 "scout_pose": pose["scout_pose"],
-                "incident_world_location": None,
+                "incident_world_location": (
+                    {
+                        "latitude_deg": camera_gps_candidate["latitude_deg"],
+                        "longitude_deg": camera_gps_candidate["longitude_deg"],
+                        "altitude_m": camera_gps_candidate["altitude_m"],
+                        "coordinate_frame": "wgs84_geodetic",
+                        "dispatchable": False,
+                    } if camera_gps_candidate else None
+                ),
                 "incident_location_status": incident_location_status,
                 "raw_frame": str(raw_frame_path),
                 "annotated_frame": str(frame_path),
@@ -915,11 +1029,9 @@ def main() -> int:
                     "vehicle": "scout_0",
                     "location_status": incident_location_status,
                     "coordinate_frame": (
-                        "local_ned_m" if any(
-                            item.get("location_status") == "validated"
-                            and item.get("dispatchable") is True
-                            for item in detections
-                        ) else "image_pixels"
+                        "local_ned_m" if has_validated_location
+                        else "wgs84_geodetic" if camera_gps_candidate
+                        else "image_pixels"
                     ),
                     "frame_width": width,
                     "frame_height": height,
@@ -935,7 +1047,15 @@ def main() -> int:
                     "pose_sync_status": pose["status"],
                     "camera_projection": camera_projection_summary,
                     "scout_pose": pose["scout_pose"],
-                    "incident_world_location": None,
+                     "incident_world_location": (
+                        {
+                            "latitude_deg": camera_gps_candidate["latitude_deg"],
+                            "longitude_deg": camera_gps_candidate["longitude_deg"],
+                            "altitude_m": camera_gps_candidate["altitude_m"],
+                            "coordinate_frame": "wgs84_geodetic",
+                            "dispatchable": False,
+                        } if camera_gps_candidate else None
+                    ),
                     "incident_location_status": incident_location_status,
                     "detections": detections,
                 }
@@ -993,8 +1113,16 @@ def main() -> int:
             "source_rejections": source_rejections,
             "gazebo_source_counters": gazebo_source.diagnostic_counters()
             if gazebo_source is not None else None,
+            "runtime_camera_info": (
+                gazebo_source.camera_info_snapshot()
+                if gazebo_source is not None else None
+            ),
             "dispatchable_observations": 0,
-            "dispatchability_note": "all camera-only detections remain unlocalized",
+            "dispatchability_note": (
+                "camera-GPS candidate projections remain non-dispatchable until "
+                "the coordinator independently approves calibration, terrain, timing, "
+                "uncertainty, and localization evidence"
+            ),
         }
         (args.output_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return 0

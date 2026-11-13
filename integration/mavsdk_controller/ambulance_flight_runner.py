@@ -66,6 +66,7 @@ class AmbulanceFlightRunner:
         config: FlightRunnerConfig | None = None,
         safety_check: Callable[[], dict] | None = None,
         flight_state_check: Callable[[str], dict] | None = None,
+        takeoff_altitude_reached: Callable[[], bool] | None = None,
     ) -> None:
         self.drone = drone
         self.offboard_session = offboard_session
@@ -79,6 +80,7 @@ class AmbulanceFlightRunner:
         self.config = config or FlightRunnerConfig()
         self.safety_check = safety_check
         self.flight_state_check = flight_state_check
+        self.takeoff_altitude_reached = takeoff_altitude_reached
         self.config.validate()
         self.state = "IDLE"
         self.flight_commands_sent = False
@@ -132,7 +134,7 @@ class AmbulanceFlightRunner:
 
                 self._require_safety("airborne")
                 if not actionable_seen:
-                    if getattr(item, "state", None) not in {"GOAL", "DETOUR"}:
+                    if getattr(item, "state", None) not in {"GOAL", "DETOUR", "CLIMB"}:
                         continue
                     actionable_seen = True
                 yield item
@@ -147,11 +149,12 @@ class AmbulanceFlightRunner:
             self._require_safety("takeoff")
             if self.airborne():
                 self._require_safety("airborne")
-                return
+                if self.takeoff_altitude_reached is None or self.takeoff_altitude_reached():
+                    return
             await asyncio.sleep(self.config.poll_interval_s)
         raise TimeoutError("ambulance_takeoff_airborne_confirmation_timeout")
 
-    async def run(self) -> dict:
+    async def run(self, *, airborne_continuation: bool = False) -> dict:
         if not self.config.execution_enabled:
             raise RuntimeError("ambulance_flight_execution_disabled")
 
@@ -160,7 +163,7 @@ class AmbulanceFlightRunner:
 
         self.state = "PREFLIGHT"
         self.flight_commands_sent = False
-        airborne_commanded = False
+        airborne_commanded = airborne_continuation
 
         try:
             result = await asyncio.wait_for(
@@ -175,24 +178,40 @@ class AmbulanceFlightRunner:
                 )
                 raise RuntimeError(f"ambulance_preflight_rejected:{reason}")
 
-            self._require_safety("pre_arm")
+            if airborne_continuation:
+                self._require_safety("airborne")
+                self.flight_commands_sent = True
+            else:
+                self._require_safety("pre_arm")
 
-            if self.airborne():
-                self.state = "REJECTED"
-                raise RuntimeError("ambulance_must_be_landed_before_new_sortie")
+                if self.airborne():
+                    self.state = "REJECTED"
+                    raise RuntimeError("ambulance_must_be_landed_before_new_sortie")
 
-            self.state = "TAKEOFF"
-            await self.drone.action.set_takeoff_altitude(
-                self.config.takeoff_altitude_m
-            )
-            self._require_safety("pre_arm")
+                self.state = "TAKEOFF"
+                await self.drone.action.set_takeoff_altitude(
+                    self.config.takeoff_altitude_m
+                )
+                self._require_safety("pre_arm")
 
-            self.flight_commands_sent = True
-            await self.drone.action.arm()
-            airborne_commanded = True
-            self._require_safety("takeoff")
-            await self.drone.action.takeoff()
-            await self._wait_for_airborne()
+                self.flight_commands_sent = True
+                await self.drone.action.arm()
+                airborne_commanded = True
+                # Arm ACK can arrive before the coordinator's armed telemetry.
+                arm_deadline = time.monotonic() + 3.0
+                while True:
+                    try:
+                        self._require_safety("takeoff")
+                        break
+                    except RuntimeError as error:
+                        if str(error) != (
+                            "ambulance_flight_state_rejected:takeoff:"
+                            "ambulance_not_armed_during_takeoff"
+                        ) or time.monotonic() >= arm_deadline:
+                            raise
+                        await asyncio.sleep(self.config.poll_interval_s)
+                await self.drone.action.takeoff()
+                await self._wait_for_airborne()
 
             self.state = "EXECUTING"
             await self.offboard_session.run(self._guarded_guidance())

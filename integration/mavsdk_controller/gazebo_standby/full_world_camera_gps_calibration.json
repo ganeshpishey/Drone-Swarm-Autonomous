@@ -1,0 +1,63 @@
+{
+  "schema_version": "scout-camera-gps-calibration-v1",
+  "calibration_id": "scout-gazebo-markers-20261111",
+  "verification_status": "empirically_verified",
+  "verification_evidence": {
+    "validation_dataset": "scout-airborne-calibration.tar.gz",
+    "validated_at_utc": "2026-11-11T12:53:06.069291+00:00",
+    "scope": "Gazebo simulation only",
+    "frames": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "maximum_frame_rms_px": 1.84
+  },
+  "camera_intrinsics": {
+    "width_px": 1280,
+    "height_px": 960,
+    "fx_px": 539.9363327,
+    "fy_px": 539.9363708,
+    "cx_px": 640.0,
+    "cy_px": 480.0
+  },
+  "distortion_model": "plumb_bob_zero",
+  "transforms": {
+    "body_frd_from_camera_optical": [
+      [
+        0.0,
+        -1.0,
+        -2.0510342851533115e-10,
+        0.0
+      ],
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        -2.0510342851533115e-10,
+        1.0,
+        0.12
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "uncertainty": {
+    "intrinsic_px": 2.0,
+    "extrinsic_translation_m": 0.02,
+    "extrinsic_rotation_rad": 0.01
+  },
+  "detection_pixel_anchor": "bbox_center",
+  "terrain_reference_id": "gazebo-earthquake-apron-collision-mesh"
+}

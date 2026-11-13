@@ -9,6 +9,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
+import os
+import xml.etree.ElementTree as ET
 import signal
 import time
 from datetime import datetime, timezone
@@ -197,31 +200,23 @@ async def run(args: argparse.Namespace, stop_requested: asyncio.Event) -> None:
         )
         await controller.hold()
 
-        print(
-            "Flying Scout to the configured survey waypoint using PX4 goto action: "
-            f"north={args.north:.1f} m, east={args.east:.1f} m, "
-            f"altitude={args.altitude:.1f} m, yaw={args.yaw_deg:.1f} deg relative to home."
-        )
-        await wait_or_operator_stop(
-            controller.goto_location(
-                args.north,
-                args.east,
-                args.altitude,
-                timeout_s=args.waypoint_timeout,
-                yaw_deg=args.yaw_deg,
-            ),
-            "waypoint navigation",
-        )
-        await controller.hold()
-        await log_snapshot("victim_area_hover_start")
-        print(
-            f"Scout is holding at the survey waypoint for {args.hold_seconds:.0f} s. "
-            "Keep the live detector running during this hold."
-        )
-        await wait_or_operator_stop(
-            asyncio.sleep(args.hold_seconds), "waypoint data collection"
-        )
-        await log_snapshot("victim_area_hover_end")
+        route = args.victim_route or [("default", args.north, args.east)]
+        hold_seconds = 12.0 if args.victim_route else args.hold_seconds
+        for name, north, east in route:
+            print(f"SCOUT_WAYPOINT_START {name} north={north:.2f} east={east:.2f}")
+            await wait_or_operator_stop(
+                controller.goto_location(
+                    north, east, args.altitude, timeout_s=args.waypoint_timeout,
+                    yaw_deg=args.yaw_deg, horizontal_tolerance_m=0.5 if args.victim_route else 1.5,
+                ),
+                "waypoint navigation",
+            )
+            await controller.hold()
+            print(f"SCOUT_WAYPOINT_HOVER {name} hold_s={hold_seconds:.1f}")
+            await log_snapshot("victim_area_hover_start")
+            await wait_or_operator_stop(asyncio.sleep(hold_seconds), "waypoint data collection")
+            await log_snapshot("victim_area_hover_end")
+            print(f"SCOUT_WAYPOINT_COMPLETE {name}")
 
         if args.skip_frame_capture:
             print(
@@ -281,6 +276,30 @@ async def run(args: argparse.Namespace, stop_requested: asyncio.Event) -> None:
         print(f"Telemetry log: {args.telemetry_log}")
 
 
+def five_victim_route(world_path: Path, spawn_pose: str) -> list[tuple[str, float, float]]:
+    """Build a Gazebo-only coverage route from the staged world's victim poses."""
+    spawn_east, spawn_north = (float(value) for value in spawn_pose.split(",")[:2])
+    world = ET.parse(world_path).getroot().find("world")
+    if world is None:
+        raise ValueError("Survey SDF has no world")
+    expected = tuple(f"incident_victim_{index}" for index in (5, 1, 2, 3, 6))
+    positions = {}
+    for include in world.findall("include"):
+        name = include.findtext("name")
+        if name not in expected:
+            continue
+        pose = include.find("pose")
+        if name in positions or pose is None or pose.get("relative_to"):
+            raise ValueError(f"Expected one world-frame pose for {name}")
+        east, north = (float(value) for value in (pose.text or "").split()[:2])
+        positions[name] = (north - spawn_north, east - spawn_east)
+    if set(positions) != set(expected) or any(
+        not math.isfinite(axis) for point in positions.values() for axis in point
+    ):
+        raise ValueError("Expected five finite victim positions in the staged world")
+    return [(name, *positions[name]) for name in expected]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--north", type=float, default=5.0)
@@ -334,6 +353,17 @@ def main() -> None:
         default=Path("/tmp/scout-day7-survey.jsonl"),
     )
     args = parser.parse_args()
+    args.victim_route = None
+    if os.environ.get("SCOUT_FIVE_VICTIMS") == "1":
+        try:
+            run_dir = Path(os.environ["DRONE_SWARM_ACTIVE_RUN_DIR"])
+            config = json.loads((HERE / "active_uavs.json").read_text())
+            args.victim_route = five_victim_route(
+                run_dir / "gz/worlds/earthquake_landslide_world.sdf",
+                config["scout_0"]["spawn_pose"],
+            )
+        except (KeyError, OSError, ValueError, ET.ParseError) as error:
+            parser.error(f"five-victim survey unavailable: {error}")
     if not 0.0 < args.minimum_altitude <= args.altitude <= args.max_altitude:
         parser.error("Require 0 < minimum-altitude <= altitude <= max-altitude")
     if args.max_altitude > 4.0:

@@ -167,6 +167,7 @@ class GazeboScoutImageSource:
             from gz.msgs10.laserscan_pb2 import LaserScan
             from gz.msgs10.pointcloud_packed_pb2 import PointCloudPacked
             from gz.msgs10.clock_pb2 import Clock
+            from gz.msgs10.camera_info_pb2 import CameraInfo
         except ImportError as error:
             raise RuntimeError("Gazebo Harmonic Python Transport 13 bindings are unavailable") from error
         finally:
@@ -178,6 +179,7 @@ class GazeboScoutImageSource:
             f"/world/{world}/model/x500_mono_cam_down_lidar_0/"
             "link/camera_link/sensor/imager/image"
         )
+        self.camera_info_topic = self.image_topic.rsplit("/", 1)[0] + "/camera_info"
         self.lidar_topic = lidar_topic
         self.pointcloud_topic = pointcloud_topic
         self.clock_topic = f"/world/{world}/clock"
@@ -186,6 +188,9 @@ class GazeboScoutImageSource:
         self.node = Node()
         self._condition = threading.Condition()
         self._latest: ImageFrame | None = None
+        self._camera_info: dict[str, Any] | None = None
+        self._camera_info_messages_received = 0
+        self._camera_info_invalid_messages = 0
         self._last_sequence: int | None = None
         self._last_image_stamp: float | None = None
         self._image_messages_received = 0
@@ -210,12 +215,59 @@ class GazeboScoutImageSource:
         self._clock_fit: dict[str, Any] = {"ready": False, "sample_count": 0}
         self._subscriptions = (
             self.node.subscribe(Image, self.image_topic, self._on_image),
+            self.node.subscribe(CameraInfo, self.camera_info_topic, self._on_camera_info),
             self.node.subscribe(LaserScan, self.lidar_topic, self._on_lidar),
             self.node.subscribe(PointCloudPacked, self.pointcloud_topic, self._on_pointcloud),
             self.node.subscribe(Clock, self.clock_topic, self._on_clock),
         )
         if not all(self._subscriptions):
-            raise RuntimeError("failed_to_subscribe_to_gazebo_image_lidar_pointcloud_or_clock")
+            raise RuntimeError("failed_to_subscribe_to_gazebo_image_camera_info_lidar_pointcloud_or_clock")
+
+    def _on_camera_info(self, message: Any) -> None:
+        """Capture runtime Gazebo camera intrinsics without changing image timing."""
+        try:
+            stamp, _, frame_id = _stamp_and_sequence(message.header)
+            width, height = int(message.width), int(message.height)
+            k = np.asarray(message.intrinsics.k, dtype=np.float64)
+            distortion = np.asarray(message.distortion.k, dtype=np.float64)
+            if (
+                width <= 0 or height <= 0
+                or k.shape != (9,)
+                or distortion.shape != (5,)
+                or not np.isfinite(k).all()
+                or not np.isfinite(distortion).all()
+                or k[0] <= 0 or k[4] <= 0
+                or abs(k[1]) > 1e-9 or abs(k[3]) > 1e-9
+                or abs(k[8] - 1.0) > 1e-9
+            ):
+                raise ValueError("camera_info_intrinsics_invalid")
+            item = {
+                "status": "runtime_camera_info_received",
+                "stamp_sim_s": stamp,
+                "frame_id": frame_id,
+                "width_px": width,
+                "height_px": height,
+                "fx_px": float(k[0]),
+                "fy_px": float(k[4]),
+                "cx_px": float(k[2]),
+                "cy_px": float(k[5]),
+                "distortion_coefficients": distortion.tolist(),
+                "source_topic": self.camera_info_topic,
+            }
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            with self._condition:
+                self._camera_info_invalid_messages += 1
+            return
+
+        with self._condition:
+            self._camera_info = item
+            self._camera_info_messages_received += 1
+            self._condition.notify_all()
+
+    def camera_info_snapshot(self) -> dict[str, Any] | None:
+        """Return the most recently received runtime CameraInfo values."""
+        with self._condition:
+            return None if self._camera_info is None else dict(self._camera_info)
 
     def _on_image(self, message: Any) -> None:
         received = time.monotonic()
@@ -488,6 +540,12 @@ class GazeboScoutImageSource:
             image_rate_hz = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) >= 2 and recent[-1] > recent[0] else None
             return {
                 "image_messages_received": self._image_messages_received,
+                "camera_info_topic": self.camera_info_topic,
+                "camera_info_messages_received": self._camera_info_messages_received,
+                "camera_info_invalid_messages": self._camera_info_invalid_messages,
+                "camera_info_status": (
+                    "received" if self._camera_info is not None else "waiting"
+                ),
                 "image_message_rate_hz": image_rate_hz,
                 "image_rate_window_s": 10.0,
                 "lidar_messages_received": self._lidar_messages_received,

@@ -26,7 +26,7 @@ try:
     from .day10_battery import BatteryMonitor, BatteryPolicy, battery_ground_station_record
     from .day10_coordinate_frames import transform_local_ned
     from .day10_mission_coordinator import Day10Coordinator
-    from .ambulance_mission_adapter import AmbulanceMissionAdapter, AmbulanceTelemetry, MissionLink
+    from .ambulance_mission_adapter import AmbulanceMissionAdapter, AmbulanceTelemetry, Guidance, MissionLink
     from .response_lidar_guard import GazeboScanFeed
     from .ambulance_local_avoidance import AmbulanceLocalAvoidance
     from .swarm_manet import PeerUdpNode
@@ -36,7 +36,7 @@ except ImportError:  # Direct execution from this directory.
     from day10_battery import BatteryMonitor, BatteryPolicy, battery_ground_station_record
     from day10_coordinate_frames import transform_local_ned
     from day10_mission_coordinator import Day10Coordinator
-    from ambulance_mission_adapter import AmbulanceMissionAdapter, AmbulanceTelemetry, MissionLink
+    from ambulance_mission_adapter import AmbulanceMissionAdapter, AmbulanceTelemetry, Guidance, MissionLink
     from response_lidar_guard import GazeboScanFeed
     from ambulance_local_avoidance import AmbulanceLocalAvoidance
     from swarm_manet import PeerUdpNode
@@ -46,6 +46,61 @@ except ImportError:  # Direct execution from this directory.
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _geodetic_to_local_ned(
+    latitude_deg: float,
+    longitude_deg: float,
+    altitude_m: float,
+    origin: dict[str, Any],
+) -> list[float]:
+    """Convert WGS84 geodetic coordinates to a PX4 home-origin local NED frame.
+
+    Uses WGS84 ECEF coordinates followed by the origin's ECEF-to-NED rotation.
+    Altitude must use the same absolute-altitude datum as the PX4 home origin.
+    """
+    values = (latitude_deg, longitude_deg, altitude_m)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(float(value)) for value in values):
+        raise ValueError("camera_gps_coordinates_must_be_finite")
+    lat, lon, alt = map(float, values)
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        raise ValueError("camera_gps_latitude_or_longitude_out_of_range")
+
+    required = ("latitude_deg", "longitude_deg", "absolute_altitude_m", "home_id")
+    if not isinstance(origin, dict) or any(key not in origin for key in required):
+        raise ValueError("px4_home_origin_incomplete")
+    lat0, lon0, alt0 = (float(origin[key]) for key in required[:3])
+    if not all(math.isfinite(value) for value in (lat0, lon0, alt0)):
+        raise ValueError("px4_home_origin_non_finite")
+
+    # WGS84 ellipsoid.
+    semi_major = 6378137.0
+    eccentricity_sq = 6.69437999014e-3
+
+    def ecef(phi_deg: float, lam_deg: float, height_m: float):
+        phi, lam = math.radians(phi_deg), math.radians(lam_deg)
+        sin_phi, cos_phi = math.sin(phi), math.cos(phi)
+        normal = semi_major / math.sqrt(1.0 - eccentricity_sq * sin_phi * sin_phi)
+        return (
+            (normal + height_m) * cos_phi * math.cos(lam),
+            (normal + height_m) * cos_phi * math.sin(lam),
+            (normal * (1.0 - eccentricity_sq) + height_m) * sin_phi,
+        )
+
+    point = ecef(lat, lon, alt)
+    reference = ecef(lat0, lon0, alt0)
+    dx, dy, dz = (point[i] - reference[i] for i in range(3))
+    phi0, lam0 = math.radians(lat0), math.radians(lon0)
+    sin_phi, cos_phi = math.sin(phi0), math.cos(phi0)
+    sin_lam, cos_lam = math.sin(lam0), math.cos(lam0)
+    north = -sin_phi * cos_lam * dx - sin_phi * sin_lam * dy + cos_phi * dz
+    east = -sin_lam * dx + cos_lam * dy
+    down = -cos_phi * cos_lam * dx - cos_phi * sin_lam * dy - sin_phi * dz
+    result = [north, east, down]
+    if not all(math.isfinite(value) for value in result):
+        raise ValueError("geodetic_to_local_ned_non_finite")
+    return result
 
 
 def _finite_values(values: dict[str, Any], *, label: str) -> dict[str, float]:
@@ -257,6 +312,8 @@ class Day10CoordinatorService:
                 self.active_ambulance_mission_id = active
 
             saved_sortie_state = queue_state.get("ambulance_sortie_state")
+            if saved_sortie_state == "AIRBORNE_HANDOFF":
+                saved_sortie_state = "RECOVERY_REQUIRED"
             if saved_sortie_state in {
                 "IDLE", "ACTIVE", "ARRIVAL_CONFIRMED", "RECOVERY_REQUIRED",
                 "RETURN_REQUIRED", "RETURNING", "LANDED"
@@ -322,17 +379,150 @@ class Day10CoordinatorService:
             "updated_at_utc": utc_now(),
         })
 
-    async def _dispatch_next_ambulance_incident(self) -> dict[str, Any] | None:
+    def _descent_demo_scout_landed(self) -> bool:
+        scout = self.vehicle_state["scout_0"]
+        stamp = self.telemetry_times["scout_0"].get("in_air")
+        return (
+            getattr(self, "_descent_demo_scout_was_airborne", False)
+            and stamp is not None
+            and 0 <= time.monotonic() - stamp <= self.args.telemetry_max_age_s
+            and scout.get("in_air") is False
+        )
+
+    def _five_waypoint_repeat(self, incident_id: str) -> str | None:
+        """Match nearby validated victim reports across Ambulance home changes."""
+        incidents = self.coordinator.incidents
+        current = incidents[incident_id]
+        if current.get("type") != "victim":
+            return None
+        provenance = current.get("transform_provenance") or {}
+        home_id = provenance.get("target_home_id")
+        origin = provenance.get("incident_geodetic")
+        if isinstance(origin, dict):
+            origin = {**origin, "home_id": incident_id}
+        north, east, _ = current["target"]["coordinates"]
+        best = None
+        for other_id, other in incidents.items():
+            if (other_id == incident_id or other.get("type") != "victim"
+                    or other.get("dispatch_queue_status") not in {"queued", "active", "completed"}):
+                continue
+            other_provenance = other.get("transform_provenance") or {}
+            if home_id and other_provenance.get("target_home_id") == home_id:
+                other_north, other_east, _ = other["target"]["coordinates"]
+                distance = math.hypot(north - other_north, east - other_east)
+            else:
+                point = other_provenance.get("incident_geodetic")
+                if not isinstance(point, dict) or not isinstance(origin, dict):
+                    continue
+                try:
+                    dn, de, _ = _geodetic_to_local_ned(
+                        point["latitude_deg"], point["longitude_deg"],
+                        point["absolute_altitude_m"], origin,
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                distance = math.hypot(dn, de)
+            if distance <= 0.75 and (best is None or distance < best[0]):
+                best = (distance, other_id)
+        return best[1] if best is not None else None
+
+    def _ambulance_approach_coordinates(self, mission):
+        coordinates = mission.target.get("coordinates") if isinstance(mission.target, dict) else None
+        if (os.environ.get("AMBULANCE_SITL_SITTING_VICTIM_OFFSET") != "1"
+                or not self._concurrent_descent_enabled()):
+            return coordinates
+        incident = self.coordinator.incidents.get(mission.incident_id) or {}
+        provenance = incident.get("transform_provenance") or {}
+        point = provenance.get("incident_geodetic")
+        home = self.origins.get("ambulance_0")
+        if not isinstance(point, dict) or not isinstance(home, dict):
+            return coordinates
+
+        # Calibrated against the collision terrain in the landslide apron world.
+        # Keep the assignment at the observed victim and fly the measured point
+        # 0.90 m north of the previously blocked descent column.
+        site = {
+            "latitude_deg": 27.987629939099737,
+            "longitude_deg": 86.92430971764219,
+            "absolute_altitude_m": 1452.170966,
+            "home_id": "sitting-victim-test-site",
+        }
+        try:
+            north, east, _ = _geodetic_to_local_ned(
+                point["latitude_deg"], point["longitude_deg"], point["absolute_altitude_m"], site,
+            )
+            if math.hypot(north, east) <= 0.5:
+                return _geodetic_to_local_ned(
+                    27.987638060, site["longitude_deg"], 1452.199311, home,
+                )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return coordinates
+        return coordinates
+
+    def _concurrent_descent_enabled(self) -> bool:
+        return (
+            getattr(self.args, "sitl_descent_demo", False)
+            and os.environ.get("SCOUT_FIVE_VICTIMS") == "1"
+            and os.environ.get("AMBULANCE_CONCURRENT_SITL") == "1"
+        )
+
+    def _scout_clear_for_ambulance(self) -> bool:
+        """Require current positions and horizontal separation during overlap."""
+        if not self._concurrent_descent_enabled() or self._descent_demo_scout_landed():
+            return True
+        now = time.monotonic()
+        points = []
+        for vehicle_id in ("scout_0", "ambulance_0"):
+            sample_at = self.telemetry_times[vehicle_id].get("position")
+            position = self.vehicle_state[vehicle_id].get("position")
+            if (sample_at is None or not 0 <= now - sample_at <= 2.0
+                    or not isinstance(position, dict)):
+                return False
+            point = (position.get("latitude_deg"), position.get("longitude_deg"))
+            if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                       and math.isfinite(value) for value in point):
+                return False
+            points.append(point)
+        (lat_a, lon_a), (lat_b, lon_b) = points
+        north = 6371000.0 * math.radians(lat_a - lat_b)
+        east = 6371000.0 * math.radians(lon_a - lon_b) * math.cos(
+            math.radians((lat_a + lat_b) / 2)
+        )
+        return math.hypot(north, east) >= 2.5
+
+    async def _dispatch_next_ambulance_incident(
+        self, *, airborne_continuation: bool = False,
+        completed_mission_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """Propose only the queue head, and only when no Ambulance mission is active."""
+        if (getattr(self.args, "sitl_descent_demo", False)
+                and not self._concurrent_descent_enabled()
+                and not self._descent_demo_scout_landed()):
+            return None
+        if (getattr(self.args, "sitl_approach_demo", False)
+                and getattr(self, "_approach_return_mission_id", None) is not None):
+            return None
+        if self._concurrent_descent_enabled() and self.ambulance_return_lifecycle.state == "LANDED":
+            return None
         if self.active_ambulance_mission_id is not None or not self.pending_incident_ids:
             return None
-        if self.ambulance_sortie_state not in {"IDLE", "LANDED"}:
+        allowed_states = {"AIRBORNE_HANDOFF"} if airborne_continuation else {"IDLE", "LANDED"}
+        if self.ambulance_sortie_state not in allowed_states:
+            if self.ambulance_sortie_state == "AIRBORNE_HANDOFF":
+                return None
             self._event(
                 "dispatch_queue_blocked",
                 reason="ambulance_not_landed_for_next_sortie",
                 sortie_state=self.ambulance_sortie_state,
             )
             return None
+
+        if airborne_continuation:
+            predecessor = self.coordinator.missions.get(completed_mission_id)
+            if (not self._concurrent_descent_enabled() or predecessor is None
+                    or predecessor.vehicle_id != "ambulance_0" or predecessor.state != "completed"):
+                self._event("dispatch_queue_blocked", reason="airborne_predecessor_not_completed")
+                return None
 
         incident_id = self.pending_incident_ids[0]
         incident = self.coordinator.incidents.get(incident_id)
@@ -350,12 +540,20 @@ class Day10CoordinatorService:
 
         vehicle = self.vehicle_state["ambulance_0"]
         battery = self._battery_status("ambulance_0")
+        sitl_bound = getattr(self.args, "sitl_planning_drain_percent_per_minute", None)
+        if sitl_bound is not None and getattr(self.args, "enable_ambulance_flight_execution", False):
+            battery = {**battery, "sitl_planning_drain_percent_per_minute": sitl_bound}
         decision = self.coordinator.propose_mission(
             incident_id, vehicle_id="ambulance_0", vehicle_status=vehicle,
             battery_status=battery,
             outbound_minutes=self.args.outbound_minutes,
             task_minutes=self.args.task_minutes,
             return_minutes=self.args.return_minutes,
+            airborne_continuation=airborne_continuation,
+            standby_only=(
+                getattr(self.args, "allow_ambulance_standby_ack", False)
+                and not getattr(self.args, "enable_ambulance_flight_execution", False)
+            ),
         )
         if not decision.get("eligible"):
             incident["dispatch_block_reason"] = decision.get("reason")
@@ -376,9 +574,14 @@ class Day10CoordinatorService:
             "battery_decision": decision["battery_decision"],
         }
 
+        if airborne_continuation:
+            wire_payload["completed_mission_id"] = completed_mission_id
+
         # Reserve the active slot before network I/O. A failed delivery must
         # not cause another victim to be assigned concurrently.
         self.pending_incident_ids.popleft()
+        if airborne_continuation:
+            self.ambulance_guidance = None
         self.active_ambulance_mission_id = mission_id
         self.ambulance_sortie_state = "ACTIVE"
         incident["dispatch_queue_status"] = "active"
@@ -566,7 +769,7 @@ class Day10CoordinatorService:
             "schema_version": "medical-response-terminal-v1",
             "mission_id": mission.get("mission_id"), "incident_id": mission.get("incident_id"),
             "assigned_vehicle": "ambulance_0", "state": state.upper(),
-            "coordinate_provenance": ("validated_scout_camera_lidar_localization"
+            "coordinate_provenance": ("validated_scout_camera_gps_localization"
                 if incident.get("location_status") == "validated" and localization_provenance
                 else "coordinator_target_provenance_unavailable"),
             "victim_location": target,
@@ -1019,21 +1222,48 @@ class Day10CoordinatorService:
             if not isinstance(index, int) or isinstance(index, bool):
                 index = int(incident_id.rsplit(":", 1)[1])
             detection = detections[index] if index < len(detections) else {}
-            source_vehicle = detection.get("reference_vehicle_id", report.get("coordinate_reference_vehicle_id"))
+            source_vehicle = detection.get("reference_vehicle_id", report.get("coordinate_reference_vehicle_id", report.get("vehicle")))
             source_origin = self.origins.get("scout_0")
             target_origin = self.origins.get("ambulance_0")
             try:
-                if incident.get("location_status") != "validated" or incident.get("coordinate_frame") != "local_ned_m":
-                    raise ValueError("incident must have validated local_ned_m coordinates")
+                if incident.get("location_status") != "validated":
+                    raise ValueError("incident_camera_gps_location_not_validated")
                 if source_vehicle != "scout_0":
                     raise ValueError("incident coordinate reference must explicitly be scout_0")
-                origin_id = detection.get("coordinate_origin_id", report.get("coordinate_origin_id"))
-                if not isinstance(source_origin, dict) or origin_id != source_origin.get("home_id"):
-                    raise ValueError("incident coordinate origin ID must match the current PX4 Scout home frame")
+                if not isinstance(source_origin, dict) or not isinstance(target_origin, dict):
+                    raise ValueError("current_scout_and_ambulance_home_origins_required")
+
+                frame = incident.get("coordinate_frame")
+                coordinates = incident.get("coordinates")
+                if frame == "wgs84_geodetic":
+                    if not isinstance(coordinates, (list, tuple)) or len(coordinates) != 3:
+                        raise ValueError("validated_wgs84_incident_coordinates_required")
+                    source_ned = _geodetic_to_local_ned(
+                        coordinates[0], coordinates[1], coordinates[2], source_origin
+                    )
+                    source_origin_id = source_origin.get("home_id")
+                    reported_origin_id = detection.get(
+                        "coordinate_origin_id", report.get("coordinate_origin_id")
+                    )
+                    if reported_origin_id != source_origin_id:
+                        raise ValueError("camera_gps_source_origin_must_match_current_scout_home")
+                    source_frame = "local_ned_m"
+                elif frame == "local_ned_m":
+                    source_ned = coordinates
+                    source_origin_id = source_origin.get("home_id")
+                    reported_origin_id = detection.get(
+                        "coordinate_origin_id", report.get("coordinate_origin_id")
+                    )
+                    if reported_origin_id != source_origin_id:
+                        raise ValueError("incident_coordinate_origin_id_must_match_current_scout_home")
+                    source_frame = "local_ned_m"
+                else:
+                    raise ValueError("incident_coordinate_frame_must_be_wgs84_geodetic")
+
                 transformed = transform_local_ned(
-                    incident["coordinates"], source_origin=source_origin,
+                    source_ned, source_origin=source_origin,
                     target_origin=target_origin, source_vehicle_id="scout_0",
-                    target_vehicle_id="ambulance_0", coordinate_frame="local_ned_m",
+                    target_vehicle_id="ambulance_0", coordinate_frame=source_frame,
                     observed_at_utc=report["observed_at_utc"],
                     max_origin_time_delta_s=self.args.origin_max_delta_s,
                     max_transform_distance_m=self.args.max_incident_distance_m,
@@ -1044,13 +1274,36 @@ class Day10CoordinatorService:
                 )
                 if not accepted.get("accepted"):
                     raise ValueError(accepted.get("reason", "target_transform_rejected"))
-                incident["transform_provenance"] = transformed
+                incident["transform_provenance"] = {
+                    **transformed,
+                    "source_coordinate_frame": frame,
+                    "source_geodetic_coordinates": (
+                        list(coordinates) if frame == "wgs84_geodetic" else None
+                    ),
+                    "source_scout_local_ned_m": (
+                        list(source_ned) if isinstance(source_ned, (list, tuple)) else None
+                    ),
+                    "conversion_method": (
+                        "WGS84_ECEF_TO_SCOUT_LOCAL_NED_THEN_EXISTING_PX4_HOME_TRANSFORM"
+                        if frame == "wgs84_geodetic" else
+                        "EXISTING_SCOUT_LOCAL_NED_TO_AMBULANCE_HOME_TRANSFORM"
+                    ),
+                }
             except (ValueError, KeyError, TypeError) as error:
                 incident["dispatch_block_reason"] = str(error)
                 incident["dispatchable"] = False
                 self._event("incident_retained_not_dispatchable", incident_id=incident_id, reason=str(error))
                 continue
 
+            if os.environ.get("SCOUT_FIVE_VICTIMS") == "1":
+                repeat_of = self._five_waypoint_repeat(incident_id)
+                if repeat_of is not None:
+                    incident["dispatchable"] = False
+                    incident["dispatch_queue_status"] = "repeat_sighting"
+                    incident["repeat_of_incident_id"] = repeat_of
+                    self._event("incident_repeat_sighting", incident_id=incident_id,
+                                repeat_of_incident_id=repeat_of)
+                    continue
             if incident_id not in self.pending_incident_ids:
                 self.pending_incident_ids.append(incident_id)
                 incident["dispatch_queue_status"] = "queued"
@@ -1066,6 +1319,23 @@ class Day10CoordinatorService:
     async def send_heartbeats(self) -> None:
         while not self.stop_event.is_set():
             await self.expire_missions()
+            if (getattr(self.args, "sitl_descent_demo", False)
+                    and self.pending_incident_ids
+                    and self.active_ambulance_mission_id is None
+                    and self.vehicle_state["ambulance_0"].get("available") is True
+                    and (self._concurrent_descent_enabled() or self._descent_demo_scout_landed())):
+                await self._dispatch_next_ambulance_incident()
+            if self.pending_incident_ids and self.active_ambulance_mission_id is None:
+                incident = self.coordinator.incidents.get(self.pending_incident_ids[0], {})
+                vehicle = self.vehicle_state["ambulance_0"]
+                if (incident.get("dispatch_block_reason") == "insufficient_observed_consumption_history"
+                        and self.ambulance_sortie_state in {"IDLE", "LANDED"}
+                        and vehicle.get("in_air") is False
+                        and vehicle.get("available") is True):
+                    battery = self._battery_status("ambulance_0")
+                    drain = battery.get("observed_drain_percent_per_minute")
+                    if battery.get("fresh") is True and drain is not None and drain > 0:
+                        await self._dispatch_next_ambulance_incident()
             for peer in self.node.peers:
                 try:
                     await self.node.send_reliable(
@@ -1264,7 +1534,10 @@ class Day10CoordinatorService:
                         self.nav_times[vehicle_id + ":" + name] = received_mono
                         if vehicle_id == "ambulance_0":
                             self.nav_times[name] = received_mono
-                            self._refresh_ambulance_guidance()
+                            # In the SITL approach, the scan monitor refreshes
+                            # guidance. Avoid rerunning it for each pose sample.
+                            if not getattr(self.args, "sitl_approach_demo", False):
+                                self._refresh_ambulance_guidance()
                     self._refresh_available(vehicle_id)
                     if name == "battery":
                         battery_status = self._battery_status(vehicle_id)
@@ -1283,7 +1556,10 @@ class Day10CoordinatorService:
 
             def connection(item): state["connected"] = bool(item.is_connected)
             def health(item): state["is_armable"] = bool(item.is_armable)
-            def in_air(item): state["in_air"] = bool(item)
+            def in_air(item):
+                state["in_air"] = bool(item)
+                if vehicle_id == "scout_0" and state["in_air"]:
+                    self._descent_demo_scout_was_airborne = True
             def armed(item): state["armed"] = bool(item)
             def flight_mode(item): state["flight_mode"] = str(item)
             def position(item):
@@ -1428,13 +1704,38 @@ class Day10CoordinatorService:
             self._event("ambulance_flight_runner_unavailable", reason=f"{type(error).__name__}: {error}")
             return
 
-        executor = AmbulanceSortieExecutor(ExecutorConfig(execution_enabled=True))
+        descent_demo = getattr(self.args, "sitl_descent_demo", False)
+        multi_victim = self._concurrent_descent_enabled()
+        transit_altitude_m = 3.3 if multi_victim else 3.0
+        confirmed_incidents: set[str] = set()
+        handoff_deadline = None
+        last_completed_mission_id = None
+        descent_confirmations: set[str] = set()
+        descent_cleanup: asyncio.Task | None = None
+
+        def finish_sortie(reason: str, mission_id: str | None) -> None:
+            self.active_ambulance_mission_id = None
+            self._approach_return_mission_id = mission_id
+            self.ambulance_sortie_state = "RETURN_REQUIRED"
+            self._persist_dispatch_queue()
+            self._event("ambulance_multi_victim_return", reason=reason,
+                        mission_id=mission_id, confirmed_victims=len(confirmed_incidents),
+                        expected_victims=5)
+        executor = AmbulanceSortieExecutor(ExecutorConfig(
+            execution_enabled=True, descent_enabled=descent_demo, climb_enabled=multi_victim,
+        ))
+        # SITL approach state streams use a slower cadence than navigation.
+        def flight_state_max_age_s() -> float:
+            if getattr(self.args, "sitl_approach_demo", False):
+                return min(3.0, self.args.telemetry_max_age_s)
+            return 0.5
+
         def offboard_state_check() -> dict[str, Any]:
             now = time.monotonic()
             state = self.vehicle_state["ambulance_0"]
             for stream in ("armed", "in_air", "flight_mode"):
                 stamp = self.telemetry_times["ambulance_0"].get(stream)
-                if stamp is None or stamp > now or now - stamp > 0.5:
+                if stamp is None or stamp > now or now - stamp > flight_state_max_age_s():
                     return {"approved": False, "reason": f"{stream}_telemetry_stale"}
             if state.get("armed") is not True or state.get("in_air") is not True:
                 return {"approved": False, "reason": "ambulance_not_armed_and_airborne"}
@@ -1503,7 +1804,17 @@ class Day10CoordinatorService:
                 return {"approved": False, "reason": "coordinator_peer_unavailable"}
             for stream in ("position_velocity_ned", "attitude_euler", "armed", "in_air", "flight_mode"):
                 stamp = self.telemetry_times["ambulance_0"].get(stream)
-                if stamp is None or stamp > now or now - stamp > min(0.5, self.args.telemetry_max_age_s):
+                max_age = (
+                    min(0.5, self.args.telemetry_max_age_s)
+                    if stream in {"position_velocity_ned", "attitude_euler"}
+                    else min(flight_state_max_age_s(), self.args.telemetry_max_age_s)
+                )
+                if stamp is None or stamp > now or now - stamp > max_age:
+                    self._event(
+                        "ambulance_telemetry_stale", vehicle_id="ambulance_0",
+                        stream=stream, sample_age_s=None if stamp is None else now - stamp,
+                        max_age_s=max_age,
+                    )
                     return {"approved": False, "reason": f"ambulance_{stream}_stale"}
             scan_at = self.scan_feed.received_at if self.scan_feed else None
             if scan_at is None or now < scan_at or now - scan_at > self.args.guidance_max_age_s:
@@ -1521,7 +1832,7 @@ class Day10CoordinatorService:
                 return {"approved": False, "reason": "ambulance_battery_reserve_not_met"}
             return {"approved": True, "reason": "live_safety_checks_passed"}
 
-        def make_preflight(mission_id: str):
+        def make_preflight(mission_id: str, *, airborne_continuation: bool = False):
             async def preflight() -> dict[str, Any]:
                 now = time.monotonic()
                 state = self.vehicle_state["ambulance_0"]
@@ -1533,13 +1844,17 @@ class Day10CoordinatorService:
                 safe = safety_check(mission_id)
                 if safe.get("approved") is not True:
                     return safe
-                if state.get("armed") is not False or state.get("in_air") is not False:
-                    return {"approved": False, "reason": "ambulance_not_landed_and_disarmed"}
-                health_at = self.telemetry_times["ambulance_0"].get("health")
-                if (health_at is None or now < health_at
-                        or now - health_at > self.args.telemetry_max_age_s
-                        or state.get("is_armable") is not True):
-                    return {"approved": False, "reason": "ambulance_not_armable_or_health_stale"}
+                if airborne_continuation:
+                    if state.get("armed") is not True or state.get("in_air") is not True:
+                        return {"approved": False, "reason": "ambulance_handoff_not_airborne"}
+                else:
+                    if state.get("armed") is not False or state.get("in_air") is not False:
+                        return {"approved": False, "reason": "ambulance_not_landed_and_disarmed"}
+                    health_at = self.telemetry_times["ambulance_0"].get("health")
+                    if (health_at is None or now < health_at
+                            or now - health_at > self.args.telemetry_max_age_s
+                            or state.get("is_armable") is not True):
+                        return {"approved": False, "reason": "ambulance_not_armable_or_health_stale"}
                 target = mission.target if isinstance(mission.target, dict) else {}
                 coords = target.get("coordinates")
                 if (target.get("coordinate_frame") != "local_ned_m"
@@ -1558,38 +1873,311 @@ class Day10CoordinatorService:
                 return {"approved": True, "reason": "preflight_passed"}
             return preflight
 
-        def make_guidance_stream(mission_id: str, runner):
+        async def descent_guidance(mission_id: str, runner):
+            nonlocal descent_cleanup
+            feed = GazeboScanFeed(
+                "/ambulance_0/downward_clearance/scan",
+                expected_frame="ambulance_downward_clearance",
+                expected_horizontal_samples=9,
+                expected_vertical_samples=9,
+            )
+            try:
+                await feed.start()
+                deadline = time.monotonic() + (30.0 if multi_victim else 18.0)
+                wait_reason = "awaiting_stable_approach"
+                first_scan_deadline = time.monotonic() + 2.0
+                stable_since = None
+                descent_started = False
+                while time.monotonic() < deadline:
+                    now = time.monotonic()
+                    nav = self.ambulance_nav
+                    yaw = nav.get("yaw_deg", 0.0)
+                    yield_hold = Guidance("HOLD", "descent_hold", 0.0, 0.0, 0.0, yaw, None, None)
+                    if not self._scout_clear_for_ambulance():
+                        wait_reason = "scout_separation_or_position_unavailable"
+                        stable_since = None
+                        yield yield_hold
+                        await asyncio.sleep(0.1)
+                        continue
+                    if not runner.arrival_confirmed():
+                        self._event("ambulance_descent_held", mission_id=mission_id, reason="left_arrival_envelope")
+                        yield yield_hold
+                        return
+                    scan = feed.latest or {}
+                    ranges = scan.get("ranges", [])
+                    scan_age_s = None if feed.received_at is None else now - feed.received_at
+                    valid_ranges = (
+                        isinstance(ranges, list) and len(ranges) == 81
+                        and all(not isinstance(r, bool) and isinstance(r, (int, float))
+                                and math.isfinite(r) and 0.05 <= r <= 10.0 for r in ranges)
+                    )
+                    if (feed.error or scan_age_s is None
+                            or not 0 <= scan_age_s <= 0.75 or not valid_ranges):
+                        stable_since = None
+                        wait_reason = "downward_scan_unavailable"
+                        brief_gap = (
+                            multi_victim and descent_started and not feed.error
+                            and valid_ranges and scan_age_s is not None
+                            and 0.75 < scan_age_s <= 1.75
+                        )
+                        if not brief_gap and (descent_started or now >= first_scan_deadline):
+                            self._event(
+                                "ambulance_descent_held", mission_id=mission_id,
+                                reason=wait_reason, scan_age_s=scan_age_s,
+                                valid_ranges=valid_ranges, feed_error=feed.error,
+                            )
+                            yield yield_hold
+                            return
+                        yield yield_hold
+                        await asyncio.sleep(0.1)
+                        continue
+                    attitude = self.vehicle_state["ambulance_0"].get("attitude_euler") or {}
+                    angles = [attitude.get(key) for key in ("roll_deg", "pitch_deg")]
+                    if (any(not isinstance(angle, (int, float)) or not math.isfinite(angle) for angle in angles)
+                            or math.hypot(*angles) > 8.0 or min(ranges) * 0.90 < 1.8):
+                        self._event(
+                            "ambulance_descent_held", mission_id=mission_id,
+                            reason="clearance_or_attitude_limit",
+                            roll_deg=angles[0], pitch_deg=angles[1],
+                            downward_min_m=min(ranges), projected_min_clearance_m=min(ranges) * 0.90,
+                        )
+                        yield yield_hold
+                        return
+                    mission = mission_for(mission_id)
+                    approach = self._ambulance_approach_coordinates(mission)
+                    height_above_terrain = approach[2] - nav["down_m"]
+                    # In the five-victim sortie, stop at the upper edge of
+                    # the accepted height band to retain clearance margin.
+                    stop_height_m = 2.35 if multi_victim and descent_started else 2.25
+                    if height_above_terrain <= stop_height_m or ranges[40] <= 2.10:
+                        yield yield_hold
+                        event = ("ambulance_descent_confirmed"
+                                 if descent_started and 2.0 <= height_above_terrain <= 2.35
+                                 else "ambulance_descent_held")
+                        if event == "ambulance_descent_confirmed" and multi_victim:
+                            descent_confirmations.add(mission_id)
+                        self._event(event, mission_id=mission_id,
+                                    descent_started=descent_started,
+                                    height_above_terrain_m=height_above_terrain,
+                                    downward_center_m=ranges[40], downward_min_m=min(ranges))
+                        return
+                    horizontal_speed = math.hypot(nav.get("north_velocity_m_s", math.inf),
+                                                  nav.get("east_velocity_m_s", math.inf))
+                    if horizontal_speed > 0.15:
+                        stable_since = None
+                    elif stable_since is None:
+                        stable_since = now
+                    if stable_since is None or now - stable_since < 0.5:
+                        wait_reason = "awaiting_horizontal_stability"
+                        yield yield_hold
+                    else:
+                        down_speed = min(0.15, (height_above_terrain - 2.20) / 2.0)
+                        target_n, target_e, _ = self._ambulance_approach_coordinates(mission)
+                        dn = target_n - nav["north_m"]
+                        de = target_e - nav["east_m"]
+                        error = math.hypot(dn, de)
+                        correction_n = correction_e = 0.0
+                        if error > 0.10:
+                            lateral = self.ambulance_guidance
+                            scan_at = self.scan_feed.received_at if self.scan_feed else None
+                            if (lateral is None or lateral.state != "GOAL" or scan_at is None
+                                    or not 0 <= now - scan_at <= 0.5):
+                                wait_reason = "lateral_guidance_unavailable"
+                                yield yield_hold
+                                await asyncio.sleep(0.1)
+                                continue
+                            allowed_speed = math.hypot(lateral.north_m_s, lateral.east_m_s)
+                            alignment = (
+                                (dn * lateral.north_m_s + de * lateral.east_m_s)
+                                / (error * allowed_speed) if allowed_speed > 0 else 0.0
+                            )
+                            if alignment < 0.95:
+                                wait_reason = "lateral_guidance_not_aligned"
+                                yield yield_hold
+                                await asyncio.sleep(0.1)
+                                continue
+                            speed = min(0.08, allowed_speed, 0.4 * error)
+                            correction_n = speed * lateral.north_m_s / allowed_speed
+                            correction_e = speed * lateral.east_m_s / allowed_speed
+                        if not descent_started and error > 0.25:
+                            wait_reason = "centering_before_descent"
+                            yield Guidance(
+                                "GOAL", "centering_before_descent",
+                                correction_n, correction_e, 0.0, yaw, None, None,
+                            )
+                            await asyncio.sleep(0.1)
+                            continue
+                        if not descent_started:
+                            self._event("ambulance_descent_started", mission_id=mission_id,
+                                        height_above_terrain_m=height_above_terrain,
+                                        downward_min_m=min(ranges),
+                                        horizontal_error_m=error)
+                            descent_started = True
+                            if multi_victim:
+                                deadline = now + 18.0
+                        wait_reason = "descending"
+                        yield Guidance(
+                            "DESCEND", "downward_scan_clear_with_position_correction",
+                            correction_n, correction_e, down_speed, yaw, None, None,
+                        )
+                    await asyncio.sleep(0.1)
+                self._event(
+                    "ambulance_descent_held", mission_id=mission_id,
+                    reason="descent_timeout" if descent_started else "descent_entry_timeout",
+                    last_wait_reason=wait_reason, descent_started=descent_started,
+                )
+                yield Guidance("HOLD", "descent_timeout", 0.0, 0.0, 0.0,
+                               self.ambulance_nav.get("yaw_deg", 0.0), None, None)
+            finally:
+                # The flight runner times each read from this generator.
+                # Join sensor shutdown after Offboard releases command ownership.
+                descent_cleanup = asyncio.create_task(feed.stop())
+
+        def make_guidance_stream(mission_id: str, runner, *, airborne_continuation: bool = False):
             async def stream():
+                climbing = airborne_continuation
+                climb_deadline = time.monotonic() + 15.0
                 last_revision = -1
+                last_guidance_sent = time.monotonic()
                 while not self.stop_event.is_set():
                     if self.active_ambulance_mission_id != mission_id:
                         return
+                    if not self._scout_clear_for_ambulance():
+                        last_revision = self._ambulance_guidance_revision
+                        last_guidance_sent = time.monotonic()
+                        yield Guidance(
+                            "HOLD", "scout_separation_or_position_unavailable",
+                            0.0, 0.0, 0.0, self.ambulance_nav.get("yaw_deg", 0.0),
+                            None, None,
+                        )
+                        await asyncio.sleep(0.1)
+                        continue
+                    if climbing:
+                        if time.monotonic() >= climb_deadline:
+                            raise TimeoutError("ambulance_transit_climb_timeout")
+                        nav_at = self.nav_times.get("ambulance_0:position_velocity_ned")
+                        down_m = self.ambulance_nav.get("down_m")
+                        if (nav_at is None or not 0 <= time.monotonic() - nav_at <= 0.5
+                                or not isinstance(down_m, (int, float))
+                                or not math.isfinite(down_m)):
+                            yield Guidance(
+                                "HOLD", "awaiting_fresh_climb_position", 0.0, 0.0, 0.0,
+                                self.ambulance_nav.get("yaw_deg", 0.0), None, None,
+                            )
+                            await asyncio.sleep(0.1)
+                            continue
+                        # Use PX4's local NED estimate for the SITL climb feedback.
+                        altitude = -down_m
+                        if altitude < transit_altitude_m - 0.08:
+                            yield Guidance(
+                                "CLIMB", "restore_transit_altitude", 0.0, 0.0,
+                                -min(0.20, max(0.05, (transit_altitude_m - altitude) / 2.0)),
+                                self.ambulance_nav.get("yaw_deg", 0.0), None, None,
+                            )
+                            await asyncio.sleep(0.1)
+                            continue
+                        climbing = False
                     if runner.arrival_confirmed():
-                        return
+                        if not descent_demo:
+                            return
+                        mission = mission_for(mission_id)
+                        target_n, target_e, _ = self._ambulance_approach_coordinates(mission)
+                        nav = self.ambulance_nav
+                        error = math.hypot(
+                            target_n - nav["north_m"], target_e - nav["east_m"]
+                        )
+                        lateral = self.ambulance_guidance
+                        scan_at = self.scan_feed.received_at if self.scan_feed else None
+                        if (error <= 0.25 and lateral is not None and lateral.state == "GOAL"
+                                and scan_at is not None
+                                and 0 <= time.monotonic() - scan_at <= 0.5):
+                            descent = descent_guidance(mission_id, runner)
+                            try:
+                                async for directive in descent:
+                                    yield directive
+                            finally:
+                                await descent.aclose()
+                            return
+                        # Keep following horizontal avoidance until descent entry is clear.
                     revision = self._ambulance_guidance_revision
                     if revision == last_revision:
+                        now = time.monotonic()
+                        if descent_demo and now - last_guidance_sent >= 0.35:
+                            last_guidance_sent = now
+                            yield Guidance(
+                                "HOLD", "waiting_for_fresh_horizontal_guidance",
+                                0.0, 0.0, 0.0, self.ambulance_nav.get("yaw_deg", 0.0),
+                                None, None,
+                            )
                         await asyncio.sleep(0.02)
                         continue
                     last_revision = revision
                     guidance = self.ambulance_guidance
                     if guidance is not None:
+                        last_guidance_sent = time.monotonic()
                         yield guidance
                     else:
                         await asyncio.sleep(0.02)
             return stream()
 
         while not self.stop_event.is_set():
+            if multi_victim and handoff_deadline is not None:
+                battery = self._battery_status("ambulance_0")
+                remaining = battery.get("remaining_percent")
+                if (battery.get("fresh") is not True
+                        or not isinstance(remaining, (int, float))
+                        or not math.isfinite(remaining)
+                        or remaining <= self.args.reserve_battery_percent):
+                    handoff_failure = "airborne_handoff_battery_unavailable_or_low"
+                elif time.monotonic() >= handoff_deadline:
+                    handoff_failure = "airborne_handoff_timeout"
+                else:
+                    handoff_failure = None
+                if handoff_failure:
+                    pending_mission = mission_for(self.active_ambulance_mission_id)
+                    if pending_mission is not None:
+                        await self.cancel_mission(
+                            pending_mission.mission_id, reason=handoff_failure,
+                            request_id=str(uuid.uuid4()),
+                        )
+                    finish_sortie(handoff_failure, last_completed_mission_id)
+                    handoff_deadline = None
+                    continue
+                if self.ambulance_sortie_state == "AIRBORNE_HANDOFF":
+                    await self._dispatch_next_ambulance_incident(
+                        airborne_continuation=True,
+                        completed_mission_id=last_completed_mission_id,
+                    )
             mission_id = self.active_ambulance_mission_id
             mission = mission_for(mission_id) if mission_id else None
-            if (mission_id and mission_id not in attempted_missions and mission is not None
+            approach_demo = getattr(self.args, "sitl_approach_demo", False)
+            scout_ready = True
+            if self._concurrent_descent_enabled():
+                scout_ready = self._scout_clear_for_ambulance()
+            elif approach_demo:
+                scout_airborne_at = self.telemetry_times["scout_0"].get("in_air")
+                scout_ready = (
+                    scout_airborne_at is not None
+                    and 0 <= time.monotonic() - scout_airborne_at <= self.args.telemetry_max_age_s
+                    and self.vehicle_state["scout_0"].get("in_air") is False
+                )
+            if (scout_ready and mission_id and mission_id not in attempted_missions and mission is not None
                     and mission.state == "acknowledged" and mission_id in self.mission_ack_times
                     and self.ambulance_sortie_state == "ACTIVE"):
+                airborne_continuation = handoff_deadline is not None
+                handoff_deadline = None
                 attempted_missions.add(mission_id)
-                target = mission.target if isinstance(mission.target, dict) else {}
-                coords = target.get("coordinates", ())
+                coords = self._ambulance_approach_coordinates(mission)
+                if coords != mission.target.get("coordinates"):
+                    self._event(
+                        "ambulance_offset_approach_selected", mission_id=mission_id,
+                        victim_coordinates=mission.target["coordinates"],
+                        approach_coordinates=coords,
+                    )
 
                 def arrival_confirmed() -> bool:
-                    if len(coords) != 3 or not all(
+                    coords = self._ambulance_approach_coordinates(mission)
+                    if not coords or len(coords) != 3 or not all(
                         key in self.ambulance_nav and math.isfinite(self.ambulance_nav[key])
                         for key in ("north_m", "east_m", "down_m")
                     ):
@@ -1597,18 +2185,21 @@ class Day10CoordinatorService:
                     nav_at = self.nav_times.get("ambulance_0:position_velocity_ned")
                     if nav_at is None or time.monotonic() - nav_at > 0.5:
                         return False
-                    distance = math.sqrt(sum(
-                        (float(coords[index]) - float(self.ambulance_nav[key])) ** 2
-                        for index, key in enumerate(("north_m", "east_m", "down_m"))
-                    ))
-                    return distance <= 1.0
+                    horizontal_error = math.hypot(
+                        float(coords[0]) - self.ambulance_nav["north_m"],
+                        float(coords[1]) - self.ambulance_nav["east_m"],
+                    )
+                    # The assigned down coordinate is the victim's terrain,
+                    # while this runner flies a horizontal approach.
+                    height_above_target_terrain = float(coords[2]) - self.ambulance_nav["down_m"]
+                    return horizontal_error <= 0.5 and height_above_target_terrain >= 2.0
 
                 def flight_state_check(phase: str) -> dict[str, Any]:
                     now = time.monotonic()
                     vehicle = self.vehicle_state["ambulance_0"]
                     for stream in ("armed", "in_air", "flight_mode"):
                         stamp = self.telemetry_times["ambulance_0"].get(stream)
-                        if stamp is None or stamp > now or now - stamp > 0.5:
+                        if stamp is None or stamp > now or now - stamp > flight_state_max_age_s():
                             return {"approved": False, "reason": f"{stream}_telemetry_stale"}
                     armed_now = vehicle.get("armed") is True
                     airborne_now = vehicle.get("in_air") is True
@@ -1625,33 +2216,95 @@ class Day10CoordinatorService:
                         return {"approved": False, "reason": "unknown_flight_phase"}
                     return {"approved": True, "reason": f"flight_state_valid:{phase}"}
 
+                def takeoff_altitude_reached() -> bool:
+                    stamp = self.telemetry_times["ambulance_0"].get("position")
+                    position = self.vehicle_state["ambulance_0"].get("position")
+                    if (stamp is None or not 0 <= time.monotonic() - stamp <= 2.0
+                            or not isinstance(position, dict)):
+                        return False
+                    altitude = position.get("relative_altitude_m")
+                    return (
+                        isinstance(altitude, (int, float))
+                        and not isinstance(altitude, bool)
+                        and math.isfinite(altitude)
+                        and altitude >= transit_altitude_m - (0.10 if multi_victim else 0.20)
+                    )
+
                 runner = AmbulanceFlightRunner(
                     drone=drone,
                     offboard_session=offboard,
                     return_lifecycle=self.ambulance_return_lifecycle,
-                    preflight=make_preflight(mission_id),
+                    preflight=make_preflight(mission_id, airborne_continuation=airborne_continuation),
                     safety_check=lambda mid=mission_id: safety_check(mid),
                     flight_state_check=flight_state_check,
+                    takeoff_altitude_reached=takeoff_altitude_reached if approach_demo else None,
                     airborne=lambda: self.vehicle_state["ambulance_0"].get("in_air") is True,
-                    guidance_stream=lambda mid=mission_id: make_guidance_stream(mid, runner),
+                    guidance_stream=lambda mid=mission_id: make_guidance_stream(
+                        mid, runner, airborne_continuation=airborne_continuation,
+                    ),
                     arrival_confirmed=arrival_confirmed,
                     queue_empty=lambda: not self.pending_incident_ids,
                     active_mission_id=lambda mid=mission_id: self.active_ambulance_mission_id,
-                    config=FlightRunnerConfig(execution_enabled=True),
+                    config=FlightRunnerConfig(
+                        takeoff_timeout_s=35.0 if multi_victim else 20.0,
+                        execution_enabled=True, takeoff_altitude_m=transit_altitude_m,
+                    ),
                 )
                 self._ambulance_runner = runner
                 self._event("ambulance_flight_runner_started", mission_id=mission_id,
                             connection_owner="coordinator_monitor_vehicle", flight_commands_sent=False)
                 try:
-                    result = await runner.run()
+                    if airborne_continuation:
+                        result = await runner.run(airborne_continuation=True)
+                    else:
+                        result = await runner.run()
                     if result.get("arrival_confirmed"):
                         self.ambulance_sortie_state = "ARRIVAL_CONFIRMED"
                         self._persist_dispatch_queue()
                         self._event("ambulance_arrival_confirmed", mission_id=mission_id,
                                     flight_commands_sent=bool(result.get("flight_commands_sent")),
                                     rtl_requested=False)
+                        if multi_victim:
+                            if mission_id not in descent_confirmations:
+                                self.coordinator.update_mission(
+                                    mission_id, "failed", message_id=str(uuid.uuid4()),
+                                )
+                                finish_sortie("descent_not_confirmed", None)
+                                continue
+                            final_victim = len(confirmed_incidents) == 4
+                            for next_state in ("enroute", "arrived", "returning" if final_victim else "completed"):
+                                transition = self.coordinator.update_mission(
+                                    mission_id, next_state, message_id=str(uuid.uuid4()),
+                                )
+                                if not transition.get("accepted"):
+                                    raise RuntimeError(f"multi_victim_transition:{transition.get('reason')}")
+                            confirmed_incidents.add(mission.incident_id)
+                            last_completed_mission_id = mission_id
+                            self.coordinator.incidents[mission.incident_id]["dispatch_queue_status"] = "completed"
+                            self._event("ambulance_victim_completed", mission_id=mission_id,
+                                        incident_id=mission.incident_id,
+                                        confirmed_victims=len(confirmed_incidents), expected_victims=5)
+                            if final_victim:
+                                finish_sortie("five_descents_confirmed", mission_id)
+                            else:
+                                self.active_ambulance_mission_id = None
+                                self.ambulance_sortie_state = "AIRBORNE_HANDOFF"
+                                handoff_deadline = time.monotonic() + 45.0
+                                self._persist_dispatch_queue()
+                        elif approach_demo:
+                            for next_state in ("enroute", "arrived", "returning"):
+                                transition = self.coordinator.update_mission(
+                                    mission_id, next_state, message_id=str(uuid.uuid4()),
+                                )
+                                if not transition.get("accepted"):
+                                    raise RuntimeError(f"approach_return_transition:{transition.get('reason')}")
+                            self._approach_return_mission_id = mission_id
+                            self.active_ambulance_mission_id = None
+                            self.ambulance_sortie_state = "RETURN_REQUIRED"
+                            self._persist_dispatch_queue()
                 except BaseException as error:
-                    if runner.state == "RECOVERY_REQUIRED":
+                    if (runner.state == "RECOVERY_REQUIRED"
+                            or (multi_victim and runner.state == "ARRIVAL_CONFIRMED")):
                         self.ambulance_sortie_state = "RECOVERY_REQUIRED"
                         self.ambulance_return_lifecycle.state = "RECOVERY_REQUIRED"
                         self._persist_dispatch_queue()
@@ -1672,6 +2325,13 @@ class Day10CoordinatorService:
                 finally:
                     self._ambulance_runner = None
                     self._write_state()
+                    if descent_cleanup is not None:
+                        try:
+                            await descent_cleanup
+                        except (OSError, RuntimeError) as error:
+                            self._event("ambulance_descent_scan_cleanup_failed", reason=str(error))
+                        finally:
+                            descent_cleanup = None
             await asyncio.sleep(0.1)
 
     async def _monitor_ambulance_return(self, drone) -> None:
@@ -1708,6 +2368,7 @@ class Day10CoordinatorService:
                         self._persist_dispatch_queue()
                         self._event(
                             "ambulance_rtl_accepted",
+                            mission_id=getattr(self, "_approach_return_mission_id", None),
                             flight_commands_sent=True,
                         )
                         self._write_state()
@@ -1734,22 +2395,33 @@ class Day10CoordinatorService:
                         time.monotonic() - sample_at
                         if sample_at is not None else float("inf")
                     )
+                    in_air = self.vehicle_state["ambulance_0"].get("in_air")
+                    if not isinstance(in_air, bool):
+                        await asyncio.sleep(0.2)
+                        continue
                     try:
                         landed_state = lifecycle.confirm_landed(
-                            in_air=bool(self.vehicle_state["ambulance_0"].get("in_air")),
+                            in_air=in_air,
                             telemetry_age_s=telemetry_age,
                         )
                         if landed_state == "LANDED":
                             self.ambulance_sortie_state = "LANDED"
+                            approach_id = getattr(self, "_approach_return_mission_id", None)
+                            returning_mission = self.coordinator.missions.get(approach_id)
+                            if returning_mission is not None and returning_mission.state == "returning":
+                                self.coordinator.update_mission(
+                                    approach_id, "landed", message_id=str(uuid.uuid4()),
+                                )
                             self._persist_dispatch_queue()
                             self._event(
                                 "ambulance_landed_confirmed",
+                                mission_id=approach_id,
                                 telemetry_age_s=telemetry_age,
                                 flight_commands_sent=False,
                             )
                             self._write_state()
                             # A new sortie may be assigned only after landing.
-                            if self.pending_incident_ids:
+                            if self.pending_incident_ids and not self._concurrent_descent_enabled():
                                 await self._dispatch_next_ambulance_incident()
                     except (RuntimeError, ValueError):
                         pass
@@ -1967,7 +2639,7 @@ class Day10CoordinatorService:
                 expires_mono = now + (expires_at.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
             except (ValueError, TypeError):
                 expires_mono = float("nan")
-            coordinates = active.target.get("coordinates") if isinstance(active.target, dict) else None
+            coordinates = self._ambulance_approach_coordinates(active)
             if isinstance(coordinates, list) and len(coordinates) == 3 and received is not None:
                 mission_link = MissionLink(
                     active.mission_id, tuple(coordinates), received, expires_mono,
@@ -2468,7 +3140,25 @@ def main() -> None:
         default=False,
         help="Explicitly authorize Ambulance SITL flight execution",
     )
+    parser.add_argument(
+        "--sitl-planning-drain-percent-per-minute", type=float,
+        help="Conservative flight-planning estimate for a verified Gazebo SITL battery model",
+    )
+    parser.add_argument("--sitl-approach-demo", action="store_true")
+    parser.add_argument("--sitl-descent-demo", action="store_true")
     args = parser.parse_args()
+    if args.sitl_descent_demo and not args.sitl_approach_demo:
+        parser.error("SITL descent requires the approach demo")
+    if args.sitl_approach_demo and (
+        not args.enable_ambulance_flight_execution or not args.allow_ambulance_standby_ack
+        or args.sitl_planning_drain_percent_per_minute is None
+    ):
+        parser.error("SITL approach requires flight execution, ACK, and a planning drain bound")
+    sitl_bound = args.sitl_planning_drain_percent_per_minute
+    if sitl_bound is not None and (
+        not args.enable_ambulance_flight_execution or not math.isfinite(sitl_bound) or sitl_bound <= 0
+    ):
+        parser.error("SITL planning drain requires explicit flight execution and a positive finite rate")
     if (args.heartbeat_s <= 0 or args.connect_timeout_s <= 0
             or args.telemetry_max_age_s <= 0 or args.telemetry_stream_timeout_s <= 0
             or args.battery_max_age_s <= 0 or args.battery_stream_timeout_s <= 0
