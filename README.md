@@ -88,6 +88,4 @@ From the repository root, stop the session after landing with `./integration/mav
 | `docs/DRONE_SWARM_14_DAY_PLAN.md` | Development roadmap and earlier acceptance criteria |
 | `docs/RELAY_LEGACY_README.md` | Setup for the separate MAPPO/RELAY experiments |
 
-## Scope
 
-Results are from software-in-the-loop simulation. Field MANET reliability, hardware flight, detector accuracy across varied scenes, and operational rescue capability remain unverified.
